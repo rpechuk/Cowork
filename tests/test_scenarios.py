@@ -10,6 +10,9 @@ Organized by feature area:
 
 from __future__ import annotations
 
+import asyncio
+import json
+
 import httpx
 import pytest
 import websockets
@@ -328,7 +331,9 @@ async def test_at_channel_mentions_every_member(
 
         await send(ws_a, "send_message", channel_id=random_id, content="@channel everyone please")
         msg = await recv_frame(ws_a, "message")
-        assert set(msg["data"]["message"]["mentions"]) == {"alice", "bob", "carol"}
+        # The author is excluded from the broadcast recipient set so they
+        # don't ping themselves.
+        assert set(msg["data"]["message"]["mentions"]) == {"bob", "carol"}
         bob_mention = await recv_frame(ws_b, "mention")
         carol_mention = await recv_frame(ws_c, "mention")
         assert bob_mention["data"]["channel_id"] == random_id
@@ -371,12 +376,14 @@ async def test_mark_read_clears_unread_state(
         random_id = (await recv_frame(ws_a, "channel_created"))["data"]["channel"]["id"]
         await recv_frame(ws_b, "channel_created")
 
-        # Bob focused elsewhere; Alice posts mentions in #random.
+        # Bob focused elsewhere; Alice posts mentions in #random. Track the
+        # ids so Bob can mark_read against a real anchor.
         await send(ws_b, "mark_read", channel_id=general_id)
         await drain(ws_b)
+        sent_ids: list[str] = []
         for content in ["@bob 1", "@bob 2", "plain"]:
             await send(ws_a, "send_message", channel_id=random_id, content=content)
-            await recv_frame(ws_a, "message")
+            sent_ids.append((await recv_frame(ws_a, "message"))["data"]["message"]["id"])
         await drain(ws_b)
 
         state = await bootstrap(client, bob["member_token"], pid)
@@ -384,8 +391,8 @@ async def test_mark_read_clears_unread_state(
         assert random_state["count"] == 3
         assert random_state["mentions"] == 2
 
-        # Bob reads #random; counts reset.
-        await send(ws_b, "mark_read", channel_id=random_id)
+        # Bob reads #random up to the latest message; counts reset.
+        await send(ws_b, "mark_read", channel_id=random_id, message_id=sent_ids[-1])
         await recv_frame(ws_b, "unread_update")
         state = await bootstrap(client, bob["member_token"], pid)
         assert state["unread"][random_id]["count"] == 0
@@ -581,3 +588,330 @@ async def test_ping_pong(server: str, client: httpx.AsyncClient) -> None:
         await recv_frame(ws, "hello")
         await send(ws, "ping")
         await recv_frame(ws, "pong")
+
+
+# ---------------------------------------------------------------------------
+# Regression tests for review findings (PR #1)
+# ---------------------------------------------------------------------------
+
+
+async def test_email_address_does_not_trigger_broadcast(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """`email@here.com` must not fire an @here broadcast (MENTION_RE anchoring)."""
+    alice = await create_project(client, "demo", "alice")
+    bob = await redeem_invite(client, alice["default_invite_token"], "bob")
+    pid = alice["project_id"]
+    async with websockets.connect(ws_url(server, alice["member_token"], pid)) as ws_a, \
+               websockets.connect(ws_url(server, bob["member_token"], pid)) as ws_b:
+        hello = await recv_frame(ws_a, "hello")
+        await recv_frame(ws_b, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        # Bob is focused elsewhere so a real @here would deliver a mention frame.
+        await send(ws_b, "create_channel", name="other")
+        other_id = (await recv_frame(ws_a, "channel_created"))["data"]["channel"]["id"]
+        await recv_frame(ws_b, "channel_created")
+        await send(ws_b, "mark_read", channel_id=other_id)
+        await drain(ws_b)
+
+        await send(ws_a, "send_message", channel_id=general_id, content="email me at alice@here.com")
+        msg = await recv_frame(ws_a, "message")
+        assert msg["data"]["message"]["mentions"] == []
+        await assert_no_frame(ws_b, "mention", within=0.2)
+
+
+async def test_url_at_does_not_trigger_mention(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """`https://x.com/@bob` must not @-mention `bob`."""
+    alice = await create_project(client, "demo", "alice")
+    bob = await redeem_invite(client, alice["default_invite_token"], "bob")
+    pid = alice["project_id"]
+    async with websockets.connect(ws_url(server, alice["member_token"], pid)) as ws_a, \
+               websockets.connect(ws_url(server, bob["member_token"], pid)) as ws_b:
+        hello = await recv_frame(ws_a, "hello")
+        await recv_frame(ws_b, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(ws_a, "create_channel", name="other")
+        other_id = (await recv_frame(ws_a, "channel_created"))["data"]["channel"]["id"]
+        await recv_frame(ws_b, "channel_created")
+        await send(ws_b, "mark_read", channel_id=other_id)
+        await drain(ws_b)
+
+        await send(ws_a, "send_message", channel_id=general_id, content="see https://x.com/@bob")
+        msg = await recv_frame(ws_a, "message")
+        assert msg["data"]["message"]["mentions"] == []
+        await assert_no_frame(ws_b, "mention", within=0.2)
+
+
+async def test_author_not_in_broadcast_recipients(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """The author of an `@channel` broadcast shouldn't get a mention frame."""
+    alice = await create_project(client, "demo", "alice")
+    bob = await redeem_invite(client, alice["default_invite_token"], "bob")
+    pid = alice["project_id"]
+    async with websockets.connect(ws_url(server, alice["member_token"], pid)) as ws_a, \
+               websockets.connect(ws_url(server, bob["member_token"], pid)) as ws_b:
+        hello = await recv_frame(ws_a, "hello")
+        await recv_frame(ws_b, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(ws_a, "create_channel", name="random")
+        random_id = (await recv_frame(ws_a, "channel_created"))["data"]["channel"]["id"]
+        await recv_frame(ws_b, "channel_created")
+        await send(ws_b, "mark_read", channel_id=general_id)
+        await drain(ws_b)
+
+        await send(ws_a, "send_message", channel_id=random_id, content="@channel all hands")
+        msg = await recv_frame(ws_a, "message")
+        assert set(msg["data"]["message"]["mentions"]) == {"bob"}  # alice excluded
+        await recv_frame(ws_b, "mention")
+        # Alice (the author) must NOT get a mention frame for her own broadcast,
+        # regardless of where she's focused.
+        await assert_no_frame(ws_a, "mention", within=0.2)
+
+
+@pytest.mark.parametrize(
+    "frame",
+    ['[]', '"hi"', '42', 'null', 'true'],
+)
+async def test_non_dict_frame_does_not_kill_ws(
+    server: str, client: httpx.AsyncClient, frame: str
+) -> None:
+    """Sending JSON that isn't an object returns an error frame and leaves the WS open."""
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        await recv_frame(ws, "hello")
+        await ws.send(frame)
+        err = await recv_frame(ws, "error")
+        assert err["data"]["code"] == "bad_frame"
+        # WS still alive: ping/pong round-trips.
+        await send(ws, "ping")
+        await recv_frame(ws, "pong")
+
+
+async def test_send_message_with_bad_parent_id_returns_error_frame(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """Bogus parent_id must surface an error frame, not a disconnect."""
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        hello = await recv_frame(ws, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(
+            ws, "send_message", channel_id=general_id, content="hi", parent_id="nope"
+        )
+        err = await recv_frame(ws, "error")
+        assert err["data"]["code"] == "bad_request"
+        # Subsequent valid traffic still works.
+        await send(ws, "send_message", channel_id=general_id, content="next")
+        await recv_frame(ws, "message")
+
+
+async def test_send_message_parent_id_must_be_same_channel(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """A parent_id referring to a message in a different channel is rejected."""
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        hello = await recv_frame(ws, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(ws, "create_channel", name="other")
+        other_id = (await recv_frame(ws, "channel_created"))["data"]["channel"]["id"]
+        await send(ws, "send_message", channel_id=general_id, content="root")
+        root_id = (await recv_frame(ws, "message"))["data"]["message"]["id"]
+        await send(
+            ws, "send_message", channel_id=other_id, content="reply", parent_id=root_id
+        )
+        err = await recv_frame(ws, "error")
+        assert "different channel" in err["data"]["message"]
+
+
+async def test_mark_read_with_bad_message_id_returns_error_frame(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """Bogus message_id must surface an error frame, not a disconnect."""
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        hello = await recv_frame(ws, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(ws, "mark_read", channel_id=general_id, message_id="nope")
+        err = await recv_frame(ws, "error")
+        assert err["data"]["code"] == "bad_request"
+        # WS still alive.
+        await send(ws, "ping")
+        await recv_frame(ws, "pong")
+
+
+async def test_mark_read_with_null_message_id_does_not_wipe_unread(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """Switching to a channel without history must not advance last_read_at."""
+    alice = await create_project(client, "demo", "alice")
+    bob = await redeem_invite(client, alice["default_invite_token"], "bob")
+    pid = alice["project_id"]
+    async with websockets.connect(ws_url(server, alice["member_token"], pid)) as ws_a:
+        hello = await recv_frame(ws_a, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        for content in ["one", "two", "three"]:
+            await send(ws_a, "send_message", channel_id=general_id, content=content)
+            await recv_frame(ws_a, "message")
+    # Bob now sends a focus signal with no message_id; unread should remain 3.
+    async with websockets.connect(ws_url(server, bob["member_token"], pid)) as ws_b:
+        await recv_frame(ws_b, "hello")
+        await send(ws_b, "mark_read", channel_id=general_id)
+        # The server still responds with an unread_update (no error).
+        await recv_frame(ws_b, "unread_update")
+    state = await bootstrap(client, bob["member_token"], pid)
+    assert state["unread"][general_id]["count"] == 3
+
+
+async def test_mark_read_anchors_to_message_timestamp(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """mark_read with a specific message_id anchors last_read_at to that message,
+    so a message that arrives after the read (but with an earlier created_at, e.g.
+    from another connection mid-flight) still counts as unread."""
+    alice = await create_project(client, "demo", "alice")
+    bob = await redeem_invite(client, alice["default_invite_token"], "bob")
+    pid = alice["project_id"]
+    async with websockets.connect(ws_url(server, alice["member_token"], pid)) as ws_a:
+        hello = await recv_frame(ws_a, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(ws_a, "send_message", channel_id=general_id, content="m1")
+        m1 = (await recv_frame(ws_a, "message"))["data"]["message"]
+        await send(ws_a, "send_message", channel_id=general_id, content="m2")
+        await recv_frame(ws_a, "message")
+        await send(ws_a, "send_message", channel_id=general_id, content="m3")
+        await recv_frame(ws_a, "message")
+
+    # Bob marks read up to m1 only; m2/m3 should still be unread.
+    async with websockets.connect(ws_url(server, bob["member_token"], pid)) as ws_b:
+        await recv_frame(ws_b, "hello")
+        await send(ws_b, "mark_read", channel_id=general_id, message_id=m1["id"])
+        upd = await recv_frame(ws_b, "unread_update")
+        assert upd["data"]["count"] == 2
+
+
+async def test_correlation_id_echoed_in_error_response(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """The optional top-level `id` must be echoed on the matching response."""
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        await recv_frame(ws, "hello")
+        await ws.send(json.dumps({"type": "ping", "id": "corr-42"}))
+        frame = await recv_frame(ws, "pong")
+        assert frame.get("id") == "corr-42"
+
+        await ws.send(json.dumps({"type": "do_a_barrel_roll", "id": "corr-99"}))
+        err = await recv_frame(ws, "error")
+        assert err.get("id") == "corr-99"
+
+
+async def test_content_length_cap_returns_error(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """Messages over the cap surface a clean error frame, not a crash."""
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        hello = await recv_frame(ws, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        huge = "x" * 16000
+        await send(ws, "send_message", channel_id=general_id, content=huge)
+        err = await recv_frame(ws, "error")
+        assert "limit" in err["data"]["message"]
+
+
+async def test_list_history_bad_limit_returns_error_frame(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        hello = await recv_frame(ws, "hello")
+        general_id = hello["data"]["channels"][0]["id"]
+        await send(ws, "list_history", channel_id=general_id, limit="abc")
+        err = await recv_frame(ws, "error")
+        assert err["data"]["code"] == "bad_request"
+        # WS still alive.
+        await send(ws, "ping")
+        await recv_frame(ws, "pong")
+
+
+@pytest.mark.parametrize("name", ["HERE", "Channel", "HeRe"])
+async def test_display_name_reserved_check_is_case_insensitive(
+    client: httpx.AsyncClient, name: str
+) -> None:
+    r = await client.post(
+        "/projects", json={"name": "p", "creator_display_name": name}
+    )
+    assert r.status_code == 400
+
+
+@pytest.mark.parametrize("name", ["here", "Channel", "HERE"])
+async def test_reserved_channel_names_rejected(
+    server: str, client: httpx.AsyncClient, name: str
+) -> None:
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        await recv_frame(ws, "hello")
+        await send(ws, "create_channel", name=name)
+        err = await recv_frame(ws, "error")
+        assert err["data"]["code"] == "bad_request"
+
+
+async def test_channel_name_length_cap(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    alice = await create_project(client, "demo", "alice")
+    async with websockets.connect(
+        ws_url(server, alice["member_token"], alice["project_id"])
+    ) as ws:
+        await recv_frame(ws, "hello")
+        await send(ws, "create_channel", name="x" * 33)
+        err = await recv_frame(ws, "error")
+        assert err["data"]["code"] == "bad_request"
+
+
+async def test_invite_max_uses_atomic_under_concurrent_redemption(
+    server: str, client: httpx.AsyncClient
+) -> None:
+    """A max_uses=1 invite must admit exactly one of N concurrent redeemers."""
+    alice = await create_project(client, "demo", "alice")
+    r = await client.post(
+        f"/projects/{alice['project_id']}/invites",
+        headers={"Authorization": f"Bearer {alice['member_token']}"},
+        json={"max_uses": 1, "expires_in_seconds": None},
+    )
+    token = r.json()["invite_token"]
+
+    async def attempt(name: str) -> int:
+        r = await client.post(
+            "/invites/redeem",
+            json={"invite_token": token, "display_name": name},
+        )
+        return r.status_code
+
+    results = await asyncio.gather(
+        attempt("alpha"), attempt("bravo"), attempt("charlie"), attempt("delta")
+    )
+    successes = [s for s in results if s == 200]
+    rejections = [s for s in results if s == 400]
+    assert len(successes) == 1, f"expected exactly 1 successful redemption, got {results}"
+    assert len(rejections) == 3

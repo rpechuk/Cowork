@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import socket
 import tempfile
 from typing import AsyncIterator
 
 import httpx
+import pytest
 import pytest_asyncio
 import uvicorn
 
@@ -28,10 +28,10 @@ def _free_port() -> int:
 
 
 @pytest_asyncio.fixture
-async def server() -> AsyncIterator[str]:
+async def server(monkeypatch: pytest.MonkeyPatch) -> AsyncIterator[str]:
     """Start a fresh server in-process. Yields the base URL."""
     tmpdir = tempfile.mkdtemp(prefix="cowork-test-")
-    os.environ["COWORK_HOME"] = tmpdir
+    monkeypatch.setenv("COWORK_HOME", tmpdir)
 
     from cowork.server.app import app
 

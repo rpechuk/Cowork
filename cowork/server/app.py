@@ -192,8 +192,13 @@ async def bootstrap(
 
 
 async def _broadcast(manager: ConnectionManager, project_id: str, frame: dict) -> None:
-    for sess in manager.sessions_for(project_id):
-        await sess.send(frame)
+    """Fan out concurrently so one slow socket doesn't head-of-line-block others.
+    ClientSession.send already swallows per-socket exceptions internally, so
+    gather will complete even if some peers have died.
+    """
+    sessions = manager.sessions_for(project_id)
+    if sessions:
+        await asyncio.gather(*(s.send(frame) for s in sessions), return_exceptions=True)
 
 
 async def _handle_send_message(
@@ -206,32 +211,33 @@ async def _handle_send_message(
     content = (data.get("content") or "").strip()
     parent_id = data.get("parent_id")
     if not channel_id or not content:
-        await sess.send({"type": "error", "data": {"code": "bad_request", "message": "channel_id and content required"}})
-        return
-    try:
-        message, mentioned = await db.post_message(channel_id, sess.member_id, content, parent_id)
-    except ValueError as e:
-        await sess.send({"type": "error", "data": {"code": "bad_request", "message": str(e)}})
-        return
+        raise ValueError("channel_id and content required")
+    message, mentioned = await db.post_message(channel_id, sess.member_id, content, parent_id)
     msg_payload = message.model_dump()
     await _broadcast(manager, sess.project_id, {"type": "message", "data": {"message": msg_payload}})
-    # Send mention pings to mentioned members who are connected.
-    mentioned_ids = {m.id for m in mentioned}
+    # Send mention pings to mentioned members who are connected (skip the
+    # author, who should never ping themselves; that case can still arise
+    # when DB resolution misses the author exclusion, e.g. legacy data).
+    mentioned_ids = {m.id for m in mentioned} - {sess.member_id}
     if mentioned_ids:
         preview = (message.content[:80] + "…") if len(message.content) > 80 else message.content
-        for s in manager.sessions_for(sess.project_id):
-            if s.member_id in mentioned_ids and s.focused_channel_id != channel_id:
-                await s.send(
-                    {
-                        "type": "mention",
-                        "data": {
-                            "channel_id": channel_id,
-                            "message_id": message.id,
-                            "by_display_name": message.display_name,
-                            "preview": preview,
-                        },
-                    }
-                )
+        targets = [
+            s for s in manager.sessions_for(sess.project_id)
+            if s.member_id in mentioned_ids and s.focused_channel_id != channel_id
+        ]
+        if targets:
+            mention_frame = {
+                "type": "mention",
+                "data": {
+                    "channel_id": channel_id,
+                    "message_id": message.id,
+                    "by_display_name": message.display_name,
+                    "preview": preview,
+                },
+            }
+            await asyncio.gather(
+                *(s.send(mention_frame) for s in targets), return_exceptions=True
+            )
 
 
 async def _handle_create_channel(
@@ -242,13 +248,8 @@ async def _handle_create_channel(
 ) -> None:
     name = (data.get("name") or "").strip()
     if not name:
-        await sess.send({"type": "error", "data": {"code": "bad_request", "message": "name required"}})
-        return
-    try:
-        channel = await db.create_channel(sess.project_id, name)
-    except ValueError as e:
-        await sess.send({"type": "error", "data": {"code": "bad_request", "message": str(e)}})
-        return
+        raise ValueError("name required")
+    channel = await db.create_channel(sess.project_id, name)
     await _broadcast(
         manager,
         sess.project_id,
@@ -259,7 +260,7 @@ async def _handle_create_channel(
 async def _handle_mark_read(sess: ClientSession, db: Database, data: dict) -> None:
     channel_id = data.get("channel_id")
     if not channel_id:
-        return
+        raise ValueError("channel_id required")
     sess.focused_channel_id = channel_id
     await db.mark_read(sess.member_id, channel_id, data.get("message_id"))
     state = await db.unread_state(sess.member_id, sess.project_id)
@@ -280,10 +281,13 @@ async def _handle_mark_read(sess: ClientSession, db: Database, data: dict) -> No
 async def _handle_list_history(sess: ClientSession, db: Database, data: dict) -> None:
     channel_id = data.get("channel_id")
     if not channel_id:
-        return
-    msgs = await db.history(
-        channel_id, data.get("before_message_id"), int(data.get("limit") or 50)
-    )
+        raise ValueError("channel_id required")
+    raw_limit = data.get("limit", 50)
+    try:
+        limit = int(raw_limit) if raw_limit is not None else 50
+    except (TypeError, ValueError):
+        raise ValueError("limit must be an integer")
+    msgs = await db.history(channel_id, data.get("before_message_id"), limit)
     await sess.send(
         {
             "type": "history",
@@ -333,20 +337,52 @@ async def ws_endpoint(
             except json.JSONDecodeError:
                 await sess.send({"type": "error", "data": {"code": "bad_json", "message": "invalid JSON"}})
                 continue
+            if not isinstance(frame, dict):
+                await sess.send({"type": "error", "data": {"code": "bad_frame", "message": "frame must be a JSON object"}})
+                continue
+            raw_data = frame.get("data")
+            data = raw_data if isinstance(raw_data, dict) else {}
             ftype = frame.get("type")
-            data = frame.get("data") or {}
-            if ftype == "send_message":
-                await _handle_send_message(sess, db, manager, data)
-            elif ftype == "create_channel":
-                await _handle_create_channel(sess, db, manager, data)
-            elif ftype == "mark_read":
-                await _handle_mark_read(sess, db, data)
-            elif ftype == "list_history":
-                await _handle_list_history(sess, db, data)
-            elif ftype == "ping":
-                await sess.send({"type": "pong"})
-            else:
-                await sess.send({"type": "error", "data": {"code": "unknown_type", "message": ftype or ""}})
+            frame_id = frame.get("id") if isinstance(frame.get("id"), str) else None
+            if ftype not in {
+                "send_message", "create_channel", "mark_read", "list_history", "ping"
+            }:
+                err = {"type": "error", "data": {"code": "unknown_type", "message": ftype or ""}}
+                if frame_id:
+                    err["id"] = frame_id
+                await sess.send(err)
+                continue
+            try:
+                if ftype == "send_message":
+                    await _handle_send_message(sess, db, manager, data)
+                elif ftype == "create_channel":
+                    await _handle_create_channel(sess, db, manager, data)
+                elif ftype == "mark_read":
+                    await _handle_mark_read(sess, db, data)
+                elif ftype == "list_history":
+                    await _handle_list_history(sess, db, data)
+                elif ftype == "ping":
+                    pong = {"type": "pong"}
+                    if frame_id:
+                        pong["id"] = frame_id
+                    await sess.send(pong)
+            except ValueError as e:
+                err = {
+                    "type": "error",
+                    "data": {"code": "bad_request", "message": str(e)},
+                }
+                if frame_id:
+                    err["id"] = frame_id
+                await sess.send(err)
+            except Exception as e:
+                logger.exception("WS handler %r crashed", ftype)
+                err = {
+                    "type": "error",
+                    "data": {"code": "internal", "message": str(e)},
+                }
+                if frame_id:
+                    err["id"] = frame_id
+                await sess.send(err)
     except WebSocketDisconnect:
         pass
     finally:

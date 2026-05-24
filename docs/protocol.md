@@ -58,8 +58,10 @@ Returns `{ "project", "channels", "members", "unread": { "<channel_id>": { count
 
 When a `send_message` body contains `@display_name` tokens, the server resolves each
 token to a project member. For every mentioned member who is not currently focused on
-that channel, the server delivers a `mention` frame and updates the per-member
-`channel_reads` row. The client uses `mention` frames to ring the terminal bell.
+that channel, the server delivers a `mention` frame. The client uses `mention` frames
+to ring the terminal bell. The `@` must not be preceded by an alphanumeric or
+`_./-`, so substrings inside email addresses and URLs are not treated as mentions.
+The author is never a recipient of their own broadcast (`@here` / `@channel`).
 
 `@channel` and `@here` both mention every member of the project. (In a later
 phase `@here` will be scoped to currently-connected members once we plumb

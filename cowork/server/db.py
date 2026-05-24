@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
 import secrets
@@ -13,8 +14,13 @@ import aiosqlite
 from cowork.shared.protocol import Channel, Member, Message, Project, UnreadState
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
-MENTION_RE = re.compile(r"@([A-Za-z0-9_][A-Za-z0-9_\-]*)")
+# Negative lookbehind keeps `email@here.com`, `https://x.com/@alice`, and
+# similar substrings from triggering mentions.
+MENTION_RE = re.compile(r"(?<![A-Za-z0-9_./\-])@([A-Za-z0-9_][A-Za-z0-9_\-]*)")
 DISPLAY_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-]{0,31}$")
+CHANNEL_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_\-]{0,31}$")
+RESERVED_NAMES = {"here", "channel"}
+MAX_CONTENT_LENGTH = 8000
 
 
 def validate_display_name(name: str) -> None:
@@ -23,8 +29,18 @@ def validate_display_name(name: str) -> None:
             "display name must be 1-32 chars, start with a letter/digit/underscore, "
             "and contain only letters, digits, underscores, or dashes"
         )
-    if name in {"here", "channel"}:
+    if name.lower() in RESERVED_NAMES:
         raise ValueError(f"'{name}' is a reserved name")
+
+
+def validate_channel_name(name: str) -> None:
+    if not CHANNEL_NAME_RE.fullmatch(name):
+        raise ValueError(
+            "channel name must be 1-32 chars, start with a letter/digit/underscore, "
+            "and contain only letters, digits, underscores, or dashes"
+        )
+    if name.lower() in RESERVED_NAMES:
+        raise ValueError(f"'{name}' is a reserved channel name")
 
 
 def hash_token(token: str) -> str:
@@ -40,9 +56,21 @@ def new_id() -> str:
 
 
 class Database:
+    """Async SQLite wrapper.
+
+    There is a single aiosqlite Connection per Database instance, so multi-
+    statement transactional units must hold `self._tx_lock` for their entire
+    duration. Without it, two concurrent transactions on the same connection
+    share an implicit SQLite transaction — a commit() from one would commit
+    the other's half-written work, and a rollback() would drop it. Read-only
+    operations don't need the lock; aiosqlite serializes individual statements
+    on its worker thread.
+    """
+
     def __init__(self, path: Path) -> None:
         self.path = path
         self._conn: Optional[aiosqlite.Connection] = None
+        self._tx_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         self._conn = await aiosqlite.connect(self.path)
@@ -89,25 +117,30 @@ class Database:
         now = time.time()
         member_token = new_token()
         invite_token = new_token()
-        await self.conn.execute(
-            "INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)",
-            (project_id, name, now),
-        )
-        await self.conn.execute(
-            "INSERT INTO project_members (id, project_id, display_name, joined_at) VALUES (?, ?, ?, ?)",
-            (member_id, project_id, creator_display_name, now),
-        )
-        await self.conn.execute(
-            "INSERT INTO member_tokens (token_hash, member_id, created_at) VALUES (?, ?, ?)",
-            (hash_token(member_token), member_id, now),
-        )
-        await self.conn.execute(
-            "INSERT INTO invite_tokens (token_hash, project_id, created_by, created_at, expires_at, max_uses, used_count)"
-            " VALUES (?, ?, ?, ?, NULL, NULL, 0)",
-            (hash_token(invite_token), project_id, member_id, now),
-        )
-        await self._create_channel(project_id, "general", now)
-        await self.conn.commit()
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)",
+                    (project_id, name, now),
+                )
+                await self.conn.execute(
+                    "INSERT INTO project_members (id, project_id, display_name, joined_at) VALUES (?, ?, ?, ?)",
+                    (member_id, project_id, creator_display_name, now),
+                )
+                await self.conn.execute(
+                    "INSERT INTO member_tokens (token_hash, member_id, created_at) VALUES (?, ?, ?)",
+                    (hash_token(member_token), member_id, now),
+                )
+                await self.conn.execute(
+                    "INSERT INTO invite_tokens (token_hash, project_id, created_by, created_at, expires_at, max_uses, used_count)"
+                    " VALUES (?, ?, ?, ?, NULL, NULL, 0)",
+                    (hash_token(invite_token), project_id, member_id, now),
+                )
+                await self._create_channel(project_id, "general", now)
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         return project_id, member_id, member_token, invite_token
 
     async def mint_invite(
@@ -120,56 +153,65 @@ class Database:
         token = new_token()
         now = time.time()
         expires_at = now + expires_in_seconds if expires_in_seconds else None
-        await self.conn.execute(
-            "INSERT INTO invite_tokens (token_hash, project_id, created_by, created_at, expires_at, max_uses, used_count)"
-            " VALUES (?, ?, ?, ?, ?, ?, 0)",
-            (hash_token(token), project_id, created_by, now, expires_at, max_uses),
-        )
-        await self.conn.commit()
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "INSERT INTO invite_tokens (token_hash, project_id, created_by, created_at, expires_at, max_uses, used_count)"
+                    " VALUES (?, ?, ?, ?, ?, ?, 0)",
+                    (hash_token(token), project_id, created_by, now, expires_at, max_uses),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         return token
 
     async def redeem_invite(self, token: str, display_name: str) -> tuple[Project, str, str]:
         validate_display_name(display_name)
         h = hash_token(token)
-        async with self.conn.execute(
-            "SELECT project_id, expires_at, max_uses, used_count FROM invite_tokens WHERE token_hash = ?",
-            (h,),
-        ) as cur:
-            row = await cur.fetchone()
-        if not row:
-            raise ValueError("invalid invite token")
-        if row["expires_at"] and row["expires_at"] < time.time():
-            raise ValueError("invite token expired")
-        if row["max_uses"] is not None and row["used_count"] >= row["max_uses"]:
-            raise ValueError("invite token exhausted")
-        project_id = row["project_id"]
-        async with self.conn.execute(
-            "SELECT 1 FROM project_members WHERE project_id = ? AND display_name = ?",
-            (project_id, display_name),
-        ) as cur:
-            if await cur.fetchone():
-                raise ValueError(f"display name '{display_name}' already taken in this project")
-        member_id = new_id()
         member_token = new_token()
+        member_id = new_id()
         now = time.time()
-        try:
-            await self.conn.execute(
-                "INSERT INTO project_members (id, project_id, display_name, joined_at) VALUES (?, ?, ?, ?)",
-                (member_id, project_id, display_name, now),
-            )
-        except aiosqlite.IntegrityError as e:
-            # Lost a race with another concurrent redemption of the same name.
-            await self.conn.rollback()
-            raise ValueError(f"display name '{display_name}' already taken in this project") from e
-        await self.conn.execute(
-            "INSERT INTO member_tokens (token_hash, member_id, created_at) VALUES (?, ?, ?)",
-            (hash_token(member_token), member_id, now),
-        )
-        await self.conn.execute(
-            "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ?",
-            (h,),
-        )
-        await self.conn.commit()
+        # Hold the tx lock for the entire SELECT-then-mutate so concurrent
+        # redemptions cannot both pass the max_uses gate.
+        async with self._tx_lock:
+            try:
+                async with self.conn.execute(
+                    "SELECT project_id, expires_at, max_uses, used_count FROM invite_tokens WHERE token_hash = ?",
+                    (h,),
+                ) as cur:
+                    row = await cur.fetchone()
+                if not row:
+                    raise ValueError("invalid invite token")
+                if row["expires_at"] and row["expires_at"] < time.time():
+                    raise ValueError("invite token expired")
+                if row["max_uses"] is not None and row["used_count"] >= row["max_uses"]:
+                    raise ValueError("invite token exhausted")
+                project_id = row["project_id"]
+                async with self.conn.execute(
+                    "SELECT 1 FROM project_members WHERE project_id = ? AND display_name = ?",
+                    (project_id, display_name),
+                ) as cur:
+                    if await cur.fetchone():
+                        raise ValueError(
+                            f"display name '{display_name}' already taken in this project"
+                        )
+                await self.conn.execute(
+                    "INSERT INTO project_members (id, project_id, display_name, joined_at) VALUES (?, ?, ?, ?)",
+                    (member_id, project_id, display_name, now),
+                )
+                await self.conn.execute(
+                    "INSERT INTO member_tokens (token_hash, member_id, created_at) VALUES (?, ?, ?)",
+                    (hash_token(member_token), member_id, now),
+                )
+                await self.conn.execute(
+                    "UPDATE invite_tokens SET used_count = used_count + 1 WHERE token_hash = ?",
+                    (h,),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         project = await self.get_project(project_id)
         assert project
         return project, member_id, member_token
@@ -218,16 +260,18 @@ class Database:
 
     async def create_channel(self, project_id: str, name: str) -> Channel:
         name = name.strip().lstrip("#")
-        if not name:
-            raise ValueError("channel name cannot be empty")
-        if not re.fullmatch(r"[A-Za-z0-9_\-]+", name):
-            raise ValueError("channel name must be alphanumeric, dashes, or underscores")
+        validate_channel_name(name)
         ts = time.time()
-        try:
-            channel_id = await self._create_channel(project_id, name, ts)
-            await self.conn.commit()
-        except aiosqlite.IntegrityError as e:
-            raise ValueError(f"channel '{name}' already exists") from e
+        async with self._tx_lock:
+            try:
+                channel_id = await self._create_channel(project_id, name, ts)
+                await self.conn.commit()
+            except aiosqlite.IntegrityError as e:
+                await self.conn.rollback()
+                raise ValueError(f"channel '{name}' already exists") from e
+            except Exception:
+                await self.conn.rollback()
+                raise
         return Channel(id=channel_id, project_id=project_id, name=name, created_at=ts)
 
     async def list_channels(self, project_id: str) -> list[Channel]:
@@ -255,26 +299,42 @@ class Database:
         content: str,
         parent_id: Optional[str],
     ) -> tuple[Message, list[Member]]:
+        if len(content) > MAX_CONTENT_LENGTH:
+            raise ValueError(f"message exceeds {MAX_CONTENT_LENGTH}-char limit")
         channel = await self.get_channel(channel_id)
         if not channel:
             raise ValueError("channel not found")
         author = await self.get_member(member_id)
         if not author or author.project_id != channel.project_id:
             raise ValueError("member does not belong to this project")
-        mentioned = await self._resolve_mentions(channel.project_id, content)
+        if parent_id is not None:
+            async with self.conn.execute(
+                "SELECT channel_id FROM messages WHERE id = ?", (parent_id,)
+            ) as cur:
+                parent_row = await cur.fetchone()
+            if not parent_row:
+                raise ValueError("parent_id does not refer to a known message")
+            if parent_row["channel_id"] != channel_id:
+                raise ValueError("parent_id belongs to a different channel")
+        mentioned = await self._resolve_mentions(channel.project_id, content, author.id)
         message_id = new_id()
         ts = time.time()
-        await self.conn.execute(
-            "INSERT INTO messages (id, channel_id, member_id, parent_id, kind, content, created_at)"
-            " VALUES (?, ?, ?, ?, 'chat', ?, ?)",
-            (message_id, channel_id, member_id, parent_id, content, ts),
-        )
-        for m in mentioned:
-            await self.conn.execute(
-                "INSERT OR IGNORE INTO message_mentions (message_id, member_id) VALUES (?, ?)",
-                (message_id, m.id),
-            )
-        await self.conn.commit()
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "INSERT INTO messages (id, channel_id, member_id, parent_id, kind, content, created_at)"
+                    " VALUES (?, ?, ?, ?, 'chat', ?, ?)",
+                    (message_id, channel_id, member_id, parent_id, content, ts),
+                )
+                for m in mentioned:
+                    await self.conn.execute(
+                        "INSERT OR IGNORE INTO message_mentions (message_id, member_id) VALUES (?, ?)",
+                        (message_id, m.id),
+                    )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
         msg = Message(
             id=message_id,
             channel_id=channel_id,
@@ -288,13 +348,15 @@ class Database:
         )
         return msg, mentioned
 
-    async def _resolve_mentions(self, project_id: str, content: str) -> list[Member]:
+    async def _resolve_mentions(
+        self, project_id: str, content: str, author_id: Optional[str] = None
+    ) -> list[Member]:
         names = {m.group(1) for m in MENTION_RE.finditer(content)}
-        # MVP: @here and @channel both fan out to every project member. A future
-        # phase can scope @here to currently-connected members once we plumb
-        # connection-state into the DB layer.
-        broadcast = bool({"here", "channel"} & names)
-        names -= {"here", "channel"}
+        # @here and @channel are case-insensitive broadcast tokens that fan out
+        # to every project member. (A later phase will scope @here to currently
+        # connected members once we plumb presence into the DB.)
+        broadcast = bool({n.lower() for n in names} & RESERVED_NAMES)
+        names = {n for n in names if n.lower() not in RESERVED_NAMES}
         members: list[Member] = []
         if names:
             placeholders = ",".join("?" for _ in names)
@@ -307,7 +369,11 @@ class Database:
         if broadcast:
             all_members = await self.list_members(project_id)
             seen = {m.id for m in members}
-            members.extend(m for m in all_members if m.id not in seen)
+            # The author is excluded from broadcast recipients so they don't
+            # ping themselves when posting `@channel hello`.
+            members.extend(
+                m for m in all_members if m.id not in seen and m.id != author_id
+            )
         return members
 
     async def history(
@@ -369,17 +435,40 @@ class Database:
 
     # ---- reads / unread ----
 
-    async def mark_read(self, member_id: str, channel_id: str, message_id: Optional[str]) -> None:
-        ts = time.time()
-        await self.conn.execute(
-            "INSERT INTO channel_reads (member_id, channel_id, last_read_message_id, last_read_at)"
-            " VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(member_id, channel_id) DO UPDATE SET"
-            " last_read_message_id = excluded.last_read_message_id,"
-            " last_read_at = excluded.last_read_at",
-            (member_id, channel_id, message_id, ts),
-        )
-        await self.conn.commit()
+    async def mark_read(
+        self, member_id: str, channel_id: str, message_id: Optional[str]
+    ) -> None:
+        # Anchor last_read_at to the actual message's created_at, not wall
+        # clock. Without this, switching to a channel with unread history
+        # would mark every historical message as read because wall-clock now
+        # is greater than every created_at. When message_id is None we leave
+        # channel_reads untouched: focus is tracked in-memory on the session
+        # for mention filtering; we only persist a read marker when there is
+        # a concrete message the user has actually seen.
+        if message_id is None:
+            return
+        async with self.conn.execute(
+            "SELECT created_at FROM messages WHERE id = ? AND channel_id = ?",
+            (message_id, channel_id),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            raise ValueError("unknown message_id for this channel")
+        msg_ts = row["created_at"]
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "INSERT INTO channel_reads (member_id, channel_id, last_read_message_id, last_read_at)"
+                    " VALUES (?, ?, ?, ?)"
+                    " ON CONFLICT(member_id, channel_id) DO UPDATE SET"
+                    " last_read_message_id = excluded.last_read_message_id,"
+                    " last_read_at = MAX(channel_reads.last_read_at, excluded.last_read_at)",
+                    (member_id, channel_id, message_id, msg_ts),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
 
     async def unread_state(self, member_id: str, project_id: str) -> dict[str, UnreadState]:
         async with self.conn.execute(
@@ -393,7 +482,9 @@ class Database:
         result: dict[str, UnreadState] = {}
         for channel_id, last_read_at in reads.items():
             async with self.conn.execute(
-                "SELECT COUNT(*) AS c FROM messages WHERE channel_id = ? AND created_at > ? AND member_id != ?",
+                "SELECT COUNT(*) AS c FROM messages"
+                " WHERE channel_id = ? AND created_at > ? AND member_id != ?"
+                " AND kind = 'chat'",
                 (channel_id, last_read_at, member_id),
             ) as cur:
                 row = await cur.fetchone()
@@ -401,7 +492,8 @@ class Database:
             async with self.conn.execute(
                 "SELECT COUNT(*) AS c FROM message_mentions mm"
                 " JOIN messages m ON m.id = mm.message_id"
-                " WHERE mm.member_id = ? AND m.channel_id = ? AND m.created_at > ?",
+                " WHERE mm.member_id = ? AND m.channel_id = ? AND m.created_at > ?"
+                " AND m.kind = 'chat'",
                 (member_id, channel_id, last_read_at),
             ) as cur:
                 row = await cur.fetchone()

@@ -168,9 +168,19 @@ class CoworkApp(App):
             elif ftype == "history":
                 cid = data.get("channel_id")
                 if cid:
-                    state.messages_by_channel[cid] = list(data.get("messages") or [])
+                    msgs = list(data.get("messages") or [])
+                    state.messages_by_channel[cid] = msgs
                     if self.current_project_id == project_id and self.current_channel_id == cid:
                         self._render_transcript()
+                        # Now that history is loaded we can record a real
+                        # read marker for the channel.
+                        if msgs:
+                            await state.connection.send(
+                                {
+                                    "type": "mark_read",
+                                    "data": {"channel_id": cid, "message_id": msgs[-1]["id"]},
+                                }
+                            )
             elif ftype == "message":
                 msg = data.get("message") or {}
                 cid = msg.get("channel_id")
@@ -270,14 +280,19 @@ class CoworkApp(App):
             self._render_transcript()
         else:
             self._render_transcript()
-        # Mark read on the server.
+        # Mark read on the server only if we have a concrete message to anchor
+        # the read marker to. Sending mark_read with message_id=None would push
+        # last_read_at to wall-clock now and wipe unread for unseen history.
         msgs = state.messages_by_channel.get(channel_id) or []
-        last_msg_id = msgs[-1]["id"] if msgs else None
-        asyncio.create_task(
-            state.connection.send(
-                {"type": "mark_read", "data": {"channel_id": channel_id, "message_id": last_msg_id}}
+        if msgs:
+            asyncio.create_task(
+                state.connection.send(
+                    {
+                        "type": "mark_read",
+                        "data": {"channel_id": channel_id, "message_id": msgs[-1]["id"]},
+                    }
+                )
             )
-        )
 
     def _refresh_tree(self) -> None:
         tree: Tree = self.query_one("#proj-tree", Tree)
