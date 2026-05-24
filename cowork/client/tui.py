@@ -24,6 +24,7 @@ from cowork.client.conn import (
     http_mint_invite,
     http_redeem_invite,
 )
+from cowork.client.invite import format_invite, parse_invite
 from cowork.paths import client_db_path
 
 logger = logging.getLogger("cowork.tui")
@@ -36,9 +37,19 @@ HELP_TEXT = """[b]Cowork commands[/b]
   /channel new <name>                  — create a new channel in the current project
   /channel <name>                      — switch to a channel
   /invite                              — mint a fresh invite token for the current project
+  /save-transcript [path]              — write the current channel transcript to a file
   /leave-project                       — remove the current project from this device
   /quit                                — exit
 Type plain text to post to the current channel. Use [b]@name[/b] to mention.
+
+[b]Copying text[/b]
+  Drag with the mouse to select text in the transcript, then press [b]ctrl+shift+c[/b]
+  to copy it (this works in most terminals). If your terminal still captures the
+  mouse, hold [b]shift[/b] while you drag to bypass Cowork's mouse handling.
+  [b]/save-transcript[/b] writes the current channel to a file for easy copying.
+
+[b]Exit[/b]
+  Press [b]ctrl+q[/b] to quit (ctrl+c is reserved so it can copy a selection).
 """
 
 
@@ -49,6 +60,11 @@ class ProjectState:
     channels: dict[str, dict] = field(default_factory=dict)
     members: dict[str, dict] = field(default_factory=dict)
     messages_by_channel: dict[str, list[dict]] = field(default_factory=dict)
+    # Per-channel set of message ids whose row has already been written to the
+    # transcript log. Lets us append new messages incrementally without re-
+    # rendering the whole transcript (and stomping on system lines like the
+    # cowork:// invite banner) every time history or a new message arrives.
+    rendered_msg_ids: dict[str, set[str]] = field(default_factory=dict)
     unread: dict[str, tuple[int, int]] = field(default_factory=dict)
     status: str = "connecting"
 
@@ -67,9 +83,14 @@ class CoworkApp(App):
     .mention { color: $warning; text-style: bold; }
     """
 
+    # Note: we deliberately do NOT bind ctrl+c. Textual uses it as the default
+    # "copy selection to clipboard" shortcut, and binding it here (especially
+    # with priority=True) would hijack the keystroke before a drag-selection
+    # copy can fire. Quit via ctrl+q or /quit.
     BINDINGS = [
-        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
+        Binding("ctrl+i", "focus_input", "Focus input", show=False),
     ]
 
     def __init__(self) -> None:
@@ -102,6 +123,11 @@ class CoworkApp(App):
         tree.show_root = False
         tree.root.expand()
         self.title = "Cowork"
+        # Critical: focus the input immediately. Without this Textual defaults
+        # focus to the first focusable widget (the Tree on the left), which
+        # silently swallows every keystroke the user types — including the
+        # /new-project command they need to connect.
+        self.query_one("#input", Input).focus()
         cached = self.cache.list_projects()
         if not cached:
             self._write_system(
@@ -121,6 +147,13 @@ class CoworkApp(App):
             else:
                 first = next(iter(self.projects))
                 self._select_project(first)
+
+    def action_focus_input(self) -> None:
+        """Snap focus back to the input field (ctrl+i)."""
+        try:
+            self.query_one("#input", Input).focus()
+        except Exception:
+            pass
 
     async def on_unmount(self) -> None:
         for state in list(self.projects.values()):
@@ -171,7 +204,9 @@ class CoworkApp(App):
                     msgs = list(data.get("messages") or [])
                     state.messages_by_channel[cid] = msgs
                     if self.current_project_id == project_id and self.current_channel_id == cid:
-                        self._render_transcript()
+                        # Append-only: don't wipe the log. System lines written
+                        # by /new-project, /invite, /help etc. stay visible.
+                        self._append_new_messages(cid, msgs)
                         # Now that history is loaded we can record a real
                         # read marker for the channel.
                         if msgs:
@@ -350,6 +385,11 @@ class CoworkApp(App):
         panel.update(Text("\n").join(lines))
 
     def _render_transcript(self) -> None:
+        """Full re-render. Called on channel switch only. Wipes the log and
+        repaints the channel header + every known message. System lines
+        (e.g. the invite-URL banner from /new-project or /invite) survive
+        across history arrivals because the history handler now uses
+        `_append_new_messages` rather than calling this method."""
         log: RichLog = self.query_one("#transcript", RichLog)
         log.clear()
         if not self.current_project_id or not self.current_channel_id:
@@ -361,15 +401,35 @@ class CoworkApp(App):
             log.write(Text(f"#{channel['name']}", style="bold underline"))
             log.write(Text(""))
         msgs = state.messages_by_channel.get(self.current_channel_id) or []
+        rendered = state.rendered_msg_ids.setdefault(self.current_channel_id, set())
+        rendered.clear()
         for m in msgs:
             log.write(self._format_message(m, state))
+            rendered.add(m["id"])
+
+    def _append_new_messages(self, channel_id: str, msgs: list[dict]) -> None:
+        """Append messages that haven't been rendered yet for the current
+        channel. No-op for channels not currently focused."""
+        if (
+            not self.current_project_id
+            or self.current_channel_id != channel_id
+        ):
+            return
+        state = self.projects[self.current_project_id]
+        rendered = state.rendered_msg_ids.setdefault(channel_id, set())
+        log: RichLog = self.query_one("#transcript", RichLog)
+        for m in msgs:
+            if m["id"] in rendered:
+                continue
+            log.write(self._format_message(m, state))
+            rendered.add(m["id"])
 
     def _append_message(self, msg: dict) -> None:
-        log: RichLog = self.query_one("#transcript", RichLog)
-        state = self.projects[self.current_project_id] if self.current_project_id else None
-        if state is None:
+        # Single-message convenience wrapper; uses the same dedupe set so
+        # echoes of our own send_message don't double-print.
+        if not self.current_project_id:
             return
-        log.write(self._format_message(msg, state))
+        self._append_new_messages(msg["channel_id"], [msg])
 
     def _format_message(self, msg: dict, state: ProjectState) -> Text:
         ts = datetime.fromtimestamp(msg["created_at"]).strftime("%H:%M")
@@ -464,6 +524,8 @@ class CoworkApp(App):
             await self._cmd_invite()
         elif cmd == "leave-project":
             await self._cmd_leave_project()
+        elif cmd == "save-transcript":
+            await self._cmd_save_transcript(args)
         else:
             self._write_system(f"[red]unknown command: /{cmd}[/red] — try /help")
 
@@ -497,17 +559,34 @@ class CoworkApp(App):
         self._server_url_hint = server_url
         await self._attach_project(cp)
         self._select_project(cp.project_id)
+        invite_url = format_invite(server_url, resp["default_invite_token"])
         self._write_system(
-            f"Created project [b]{name}[/b]. Invite token (share to add others): "
-            f"[b]{resp['default_invite_token']}[/b]"
+            f"Created project [b]{name}[/b]. Share either of these so others can join:\n"
+            f"  [b]{invite_url}[/b]\n"
+            f"  [b]/join {invite_url}[/b]"
         )
 
     async def _cmd_join(self, args: list[str]) -> None:
-        if len(args) < 2:
-            self._write_system("[red]usage: /join <server-url> <invite-token> [display-name][/red]")
+        # Accept either:   /join cowork://host:port#TOKEN [display-name]
+        # or the legacy:   /join <server-url> <invite-token> [display-name]
+        if len(args) == 0:
+            self._write_system(
+                "[red]usage: /join <cowork-url> [display-name]"
+                " | /join <server-url> <invite-token> [display-name][/red]"
+            )
             return
-        server_url, invite_token = args[0], args[1]
-        display_name = args[2] if len(args) > 2 else self._guess_display_name()
+        try:
+            server_url, invite_token = parse_invite(args[0])
+            display_name = args[1] if len(args) > 1 else self._guess_display_name()
+        except ValueError:
+            if len(args) < 2:
+                self._write_system(
+                    "[red]usage: /join <cowork-url> [display-name]"
+                    " | /join <server-url> <invite-token> [display-name][/red]"
+                )
+                return
+            server_url, invite_token = args[0], args[1]
+            display_name = args[2] if len(args) > 2 else self._guess_display_name()
         try:
             resp = await http_redeem_invite(server_url, invite_token, display_name)
         except ServerError as e:
@@ -566,9 +645,11 @@ class CoworkApp(App):
         except ServerError as e:
             self._write_system(f"[red]server error: {e}[/red]")
             return
+        invite_url = format_invite(state.cached.server_url, resp["invite_token"])
         self._write_system(
-            f"Invite token for [b]{state.cached.project_name}[/b]: [b]{resp['invite_token']}[/b]\n"
-            f"They join with: /join {state.cached.server_url} {resp['invite_token']}"
+            f"Invite for [b]{state.cached.project_name}[/b]:\n"
+            f"  [b]{invite_url}[/b]\n"
+            f"They join with: [b]/join {invite_url}[/b]"
         )
 
     async def _cmd_leave_project(self) -> None:
@@ -587,6 +668,37 @@ class CoworkApp(App):
             self._refresh_members_panel()
         self._refresh_tree()
         self._write_system(f"Left {state.cached.project_name} on this device.")
+
+    async def _cmd_save_transcript(self, args: list[str]) -> None:
+        """Write the current channel transcript to a file so users have a
+        guaranteed copy-paste path even when terminal mouse capture is on."""
+        if not self.current_project_id or not self.current_channel_id:
+            self._write_system("[red]no channel selected[/red]")
+            return
+        state = self.projects[self.current_project_id]
+        msgs = state.messages_by_channel.get(self.current_channel_id) or []
+        channel = state.channels.get(self.current_channel_id, {})
+        channel_name = channel.get("name", self.current_channel_id)
+        from pathlib import Path
+
+        from cowork.paths import data_dir
+
+        if args:
+            out_path = Path(args[0]).expanduser().resolve()
+        else:
+            out_dir = data_dir() / "transcripts"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"{state.cached.project_name}-{channel_name}.txt"
+        lines = [f"# {state.cached.project_name} / #{channel_name}", ""]
+        for m in msgs:
+            ts = datetime.fromtimestamp(m["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(f"[{ts}] @{m['display_name']}: {m['content']}")
+        try:
+            out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError as e:
+            self._write_system(f"[red]could not write {out_path}: {e}[/red]")
+            return
+        self._write_system(f"Wrote {len(msgs)} messages to [b]{out_path}[/b]")
 
     def _guess_display_name(self) -> str:
         import os
