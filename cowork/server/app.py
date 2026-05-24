@@ -16,10 +16,14 @@ from fastapi import (
     WebSocketDisconnect,
 )
 
-from cowork.paths import server_db_path
+from cowork.paths import data_dir, server_db_path
+from cowork.server.agents import AgentManager
 from cowork.server.db import Database
 from cowork.shared.protocol import (
+    Agent,
     BootstrapResponse,
+    CreateAgentRequest,
+    CreateAgentResponse,
     CreateProjectRequest,
     CreateProjectResponse,
     MintInviteRequest,
@@ -54,8 +58,18 @@ class ConnectionManager:
         return list(self._by_project.get(project_id, ()))
 
 
+_NEXT_SESSION_ID = 0
+
+
+def _next_session_id() -> int:
+    global _NEXT_SESSION_ID
+    _NEXT_SESSION_ID += 1
+    return _NEXT_SESSION_ID
+
+
 class ClientSession:
     def __init__(self, ws: WebSocket, member_id: str, project_id: str) -> None:
+        self.id = _next_session_id()
         self.ws = ws
         self.member_id = member_id
         self.project_id = project_id
@@ -68,15 +82,71 @@ class ClientSession:
             logger.exception("failed to send frame")
 
 
+async def _post_as_agent_factory(app: FastAPI):
+    """Build the AgentManager.post_as_agent callback. The agent's reply goes
+    through the same db.post_message + broadcast path as a human message,
+    so other agents listening on the channel can chain off it (subject to
+    the loop guard)."""
+
+    async def post_as_agent(channel_id: str, agent_member_id: str, content: str) -> None:
+        db: Database = app.state.db
+        manager: ConnectionManager = app.state.conn_manager
+        message, mentioned = await db.post_message(channel_id, agent_member_id, content, None)
+        msg_payload = message.model_dump()
+        channel = await db.get_channel(channel_id)
+        if channel is None:
+            return
+        await _broadcast(
+            manager,
+            channel.project_id,
+            {"type": "message", "data": {"message": msg_payload}},
+        )
+        mentioned_ids = {m.id for m in mentioned} - {agent_member_id}
+        if mentioned_ids:
+            preview = (
+                (message.content[:80] + "…") if len(message.content) > 80 else message.content
+            )
+            targets = [
+                s for s in manager.sessions_for(channel.project_id)
+                if s.member_id in mentioned_ids and s.focused_channel_id != channel_id
+            ]
+            if targets:
+                mention_frame = {
+                    "type": "mention",
+                    "data": {
+                        "channel_id": channel_id,
+                        "message_id": message.id,
+                        "by_display_name": message.display_name,
+                        "preview": preview,
+                    },
+                }
+                await asyncio.gather(
+                    *(s.send(mention_frame) for s in targets), return_exceptions=True
+                )
+        # Chain into the agent manager so other agents may respond.
+        await app.state.agent_manager.on_message(message)
+
+    return post_as_agent
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     db = Database(server_db_path())
     await db.connect()
     app.state.db = db
     app.state.conn_manager = ConnectionManager()
+    workspace_root = data_dir() / "workspaces"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    post_as_agent = await _post_as_agent_factory(app)
+    app.state.agent_manager = AgentManager(
+        db=db,
+        workspace_root=workspace_root,
+        post_as_agent=post_as_agent,
+    )
     try:
         yield
     finally:
+        await app.state.agent_manager.shutdown()
         await db.close()
 
 
@@ -89,6 +159,10 @@ async def db_dep() -> Database:
 
 async def conn_manager_dep() -> ConnectionManager:
     return app.state.conn_manager
+
+
+async def agent_manager_dep() -> AgentManager:
+    return app.state.agent_manager
 
 
 async def bearer_member(
@@ -178,14 +252,82 @@ async def bootstrap(
         raise HTTPException(status_code=404, detail="project not found")
     channels = await db.list_channels(project_id)
     members = await db.list_members(project_id)
+    agents = await db.list_agents(project_id)
     unread = await db.unread_state(member_id, project_id)
     return BootstrapResponse(
         project=project,
         member_id=member_id,
         channels=channels,
         members=members,
+        agents=agents,
         unread=unread,
     )
+
+
+@app.post("/projects/{project_id}/agents", response_model=CreateAgentResponse)
+async def create_agent(
+    project_id: str,
+    req: CreateAgentRequest,
+    member: tuple[str, str] = Depends(bearer_member),
+    db: Database = Depends(db_dep),
+    manager: ConnectionManager = Depends(conn_manager_dep),
+):
+    member_id, member_project = member
+    if member_project != project_id:
+        raise HTTPException(status_code=403, detail="not a member of this project")
+    try:
+        agent = await db.create_agent(
+            project_id=project_id,
+            owner_member_id=member_id,
+            display_name=req.display_name.strip(),
+            system_prompt=req.system_prompt,
+            trigger_mode=req.trigger_mode,
+            model=req.model,
+            channel_id=req.channel_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    new_member = await db.get_member(agent.member_id)
+    if new_member:
+        await _broadcast(
+            manager, project_id, {"type": "member_joined", "data": {"member": new_member.model_dump()}}
+        )
+    await _broadcast(
+        manager, project_id, {"type": "agent_created", "data": {"agent": agent.model_dump()}}
+    )
+    return CreateAgentResponse(agent=agent)
+
+
+@app.delete("/projects/{project_id}/agents/{agent_id}")
+async def delete_agent(
+    project_id: str,
+    agent_id: str,
+    member: tuple[str, str] = Depends(bearer_member),
+    db: Database = Depends(db_dep),
+    manager: ConnectionManager = Depends(conn_manager_dep),
+):
+    member_id, member_project = member
+    if member_project != project_id:
+        raise HTTPException(status_code=403, detail="not a member of this project")
+    ok = await db.delete_agent(project_id, agent_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="agent not found")
+    await _broadcast(
+        manager, project_id, {"type": "agent_removed", "data": {"member_id": agent_id}}
+    )
+    return {"ok": True}
+
+
+@app.get("/projects/{project_id}/agents", response_model=list[Agent])
+async def list_agents(
+    project_id: str,
+    member: tuple[str, str] = Depends(bearer_member),
+    db: Database = Depends(db_dep),
+):
+    _, member_project = member
+    if member_project != project_id:
+        raise HTTPException(status_code=403, detail="not a member of this project")
+    return await db.list_agents(project_id)
 
 
 # ---- WebSocket ----
@@ -205,6 +347,7 @@ async def _handle_send_message(
     sess: ClientSession,
     db: Database,
     manager: ConnectionManager,
+    agents: AgentManager,
     data: dict,
 ) -> None:
     channel_id = data.get("channel_id")
@@ -238,6 +381,9 @@ async def _handle_send_message(
             await asyncio.gather(
                 *(s.send(mention_frame) for s in targets), return_exceptions=True
             )
+    # Hand off to the agent dispatcher (does nothing if no agents are
+    # configured for this channel or no owner has registered an API key).
+    await agents.on_message(message)
 
 
 async def _handle_create_channel(
@@ -307,6 +453,7 @@ async def ws_endpoint(
 ):
     db: Database = ws.app.state.db
     manager: ConnectionManager = ws.app.state.conn_manager
+    agents: AgentManager = ws.app.state.agent_manager
     info = await db.member_for_token(token)
     if not info or info[1] != project_id:
         await ws.close(code=4401)
@@ -319,6 +466,7 @@ async def ws_endpoint(
         project = await db.get_project(project_id)
         channels = await db.list_channels(project_id)
         members = await db.list_members(project_id)
+        project_agents = await db.list_agents(project_id)
         await sess.send(
             {
                 "type": "hello",
@@ -327,6 +475,7 @@ async def ws_endpoint(
                     "member_id": member_id,
                     "channels": [c.model_dump() for c in channels],
                     "members": [m.model_dump() for m in members],
+                    "agents": [a.model_dump() for a in project_agents],
                 },
             }
         )
@@ -345,7 +494,8 @@ async def ws_endpoint(
             ftype = frame.get("type")
             frame_id = frame.get("id") if isinstance(frame.get("id"), str) else None
             if ftype not in {
-                "send_message", "create_channel", "mark_read", "list_history", "ping"
+                "send_message", "create_channel", "mark_read", "list_history", "ping",
+                "register_api_key",
             }:
                 err = {"type": "error", "data": {"code": "unknown_type", "message": ftype or ""}}
                 if frame_id:
@@ -354,13 +504,22 @@ async def ws_endpoint(
                 continue
             try:
                 if ftype == "send_message":
-                    await _handle_send_message(sess, db, manager, data)
+                    await _handle_send_message(sess, db, manager, agents, data)
                 elif ftype == "create_channel":
                     await _handle_create_channel(sess, db, manager, data)
                 elif ftype == "mark_read":
                     await _handle_mark_read(sess, db, data)
                 elif ftype == "list_history":
                     await _handle_list_history(sess, db, data)
+                elif ftype == "register_api_key":
+                    key = data.get("api_key")
+                    if not isinstance(key, str) or not key.strip():
+                        raise ValueError("api_key required")
+                    agents.register_api_key(sess.member_id, sess.id, key.strip())
+                    ack = {"type": "api_key_registered"}
+                    if frame_id:
+                        ack["id"] = frame_id
+                    await sess.send(ack)
                 elif ftype == "ping":
                     pong = {"type": "pong"}
                     if frame_id:
@@ -386,4 +545,5 @@ async def ws_endpoint(
     except WebSocketDisconnect:
         pass
     finally:
+        agents.release_connection(sess.member_id, sess.id)
         await manager.remove(sess)

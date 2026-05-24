@@ -20,7 +20,9 @@ from cowork.client.conn import (
     ProjectConnection,
     ServerError,
     http_bootstrap,
+    http_create_agent,
     http_create_project,
+    http_delete_agent,
     http_mint_invite,
     http_redeem_invite,
 )
@@ -37,6 +39,10 @@ HELP_TEXT = """[b]Cowork commands[/b]
   /channel new <name>                  — create a new channel in the current project
   /channel <name>                      — switch to a channel
   /invite                              — mint a fresh invite token for the current project
+  /api-key <sk-...>                    — register your Anthropic key for this project
+  /agent add <name> <trigger> [prompt] — spawn an agent (trigger: always|on_mention|on_question)
+  /agent list                          — list agents in this project
+  /agent remove <name>                 — remove an agent
   /save-transcript [path]              — write the current channel transcript to a file
   /leave-project                       — remove the current project from this device
   /quit                                — exit
@@ -59,6 +65,7 @@ class ProjectState:
     connection: ProjectConnection
     channels: dict[str, dict] = field(default_factory=dict)
     members: dict[str, dict] = field(default_factory=dict)
+    agents: dict[str, dict] = field(default_factory=dict)
     messages_by_channel: dict[str, list[dict]] = field(default_factory=dict)
     # Per-channel set of message ids whose row has already been written to the
     # transcript log. Lets us append new messages incrementally without re-
@@ -67,6 +74,7 @@ class ProjectState:
     rendered_msg_ids: dict[str, set[str]] = field(default_factory=dict)
     unread: dict[str, tuple[int, int]] = field(default_factory=dict)
     status: str = "connecting"
+    api_key_registered: bool = False
 
 
 class CoworkApp(App):
@@ -176,12 +184,21 @@ class CoworkApp(App):
             data = await http_bootstrap(cp.server_url, cp.member_token, cp.project_id)
             state.channels = {c["id"]: c for c in data.get("channels", [])}
             state.members = {m["id"]: m for m in data.get("members", [])}
+            state.agents = {a["member_id"]: a for a in data.get("agents", [])}
             for cid, u in (data.get("unread") or {}).items():
                 state.unread[cid] = (int(u.get("count", 0)), int(u.get("mentions", 0)))
         except ServerError as e:
             self._write_system(f"[red]Failed to bootstrap {cp.project_name}: {e}[/red]")
         conn.start()
+        # Auto-register cached API key for this project so agents come online
+        # without the user having to retype it.
+        cached_key = self.cache.get_api_key(cp.project_id)
+        if cached_key:
+            asyncio.create_task(self._register_api_key(state, cached_key))
         self._refresh_tree()
+
+    async def _register_api_key(self, state: ProjectState, api_key: str) -> None:
+        await state.connection.send({"type": "register_api_key", "data": {"api_key": api_key}})
 
     def _make_frame_handler(self, project_id: str):
         async def handle(ftype: str, data: dict) -> None:
@@ -241,9 +258,28 @@ class CoworkApp(App):
                 if member.get("id"):
                     state.members[member["id"]] = member
                     self._refresh_members_panel()
+                    label = "agent" if member.get("is_agent") else ""
+                    suffix = f" ({label})" if label else ""
                     self._write_system_in_project(
-                        project_id, f"[dim]→ @{member.get('display_name')} joined[/dim]"
+                        project_id,
+                        f"[dim]→ @{member.get('display_name')}{suffix} joined[/dim]",
                     )
+            elif ftype == "agent_created":
+                agent = data.get("agent") or {}
+                if agent.get("member_id"):
+                    state.agents[agent["member_id"]] = agent
+                    self._refresh_members_panel()
+            elif ftype == "agent_removed":
+                mid = data.get("member_id")
+                if mid:
+                    state.agents.pop(mid, None)
+                    state.members.pop(mid, None)
+                    self._refresh_members_panel()
+            elif ftype == "api_key_registered":
+                state.api_key_registered = True
+                self._write_system_in_project(
+                    project_id, "[dim]API key registered; your agents are live.[/dim]"
+                )
             elif ftype == "mention":
                 cid = data.get("channel_id")
                 if cid:
@@ -375,13 +411,21 @@ class CoworkApp(App):
             panel.update("(no project)")
             return
         state = self.projects[self.current_project_id]
-        lines = [Text("Members", style="bold underline"), Text("")]
-        for m in state.members.values():
+        humans = [m for m in state.members.values() if not m.get("is_agent")]
+        agents = [m for m in state.members.values() if m.get("is_agent")]
+        lines: list[Text] = [Text("Members", style="bold underline"), Text("")]
+        for m in humans:
             t = Text()
             t.append(f"@{m['display_name']}")
             if m["id"] == state.cached.member_id:
                 t.append("  (you)", style="dim")
             lines.append(t)
+        if agents:
+            lines.extend([Text(""), Text("Agents", style="bold underline magenta")])
+            for m in agents:
+                t = Text()
+                t.append(f"@{m['display_name']}", style="magenta")
+                lines.append(t)
         panel.update(Text("\n").join(lines))
 
     def _render_transcript(self) -> None:
@@ -433,13 +477,17 @@ class CoworkApp(App):
 
     def _format_message(self, msg: dict, state: ProjectState) -> Text:
         ts = datetime.fromtimestamp(msg["created_at"]).strftime("%H:%M")
+        is_agent = msg["member_id"] in state.agents
         prefix = Text()
         prefix.append(f"{ts} ", style="dim")
-        prefix.append(f"@{msg['display_name']}", style="bold cyan")
+        name_style = "bold magenta" if is_agent else "bold cyan"
+        prefix.append(f"@{msg['display_name']}", style=name_style)
+        if is_agent:
+            prefix.append(" [agent]", style="magenta")
         prefix.append("  ")
         body = Text(msg["content"])
         my_name = state.cached.display_name
-        if any(name == my_name for name in (msg.get("mentions") or [])):
+        if my_name in (msg.get("mentions") or []):
             body.stylize("yellow bold")
         out = Text()
         out.append_text(prefix)
@@ -526,6 +574,10 @@ class CoworkApp(App):
             await self._cmd_leave_project()
         elif cmd == "save-transcript":
             await self._cmd_save_transcript(args)
+        elif cmd == "api-key":
+            await self._cmd_api_key(args)
+        elif cmd == "agent":
+            await self._cmd_agent(args)
         else:
             self._write_system(f"[red]unknown command: /{cmd}[/red] — try /help")
 
@@ -699,6 +751,92 @@ class CoworkApp(App):
             self._write_system(f"[red]could not write {out_path}: {e}[/red]")
             return
         self._write_system(f"Wrote {len(msgs)} messages to [b]{out_path}[/b]")
+
+    async def _cmd_api_key(self, args: list[str]) -> None:
+        if not self.current_project_id:
+            self._write_system("[red]no project selected[/red]")
+            return
+        if len(args) < 1:
+            self._write_system("[red]usage: /api-key <sk-ant-...>[/red]")
+            return
+        key = args[0]
+        state = self.projects[self.current_project_id]
+        self.cache.set_api_key(state.cached.project_id, key)
+        await self._register_api_key(state, key)
+
+    async def _cmd_agent(self, args: list[str]) -> None:
+        if not self.current_project_id:
+            self._write_system("[red]no project selected[/red]")
+            return
+        state = self.projects[self.current_project_id]
+        if not args:
+            self._write_system("[red]usage: /agent add|list|remove ...[/red]")
+            return
+        sub = args[0]
+        if sub == "list":
+            if not state.agents:
+                self._write_system("(no agents in this project)")
+                return
+            for agent in state.agents.values():
+                scope = (
+                    f"#{state.channels.get(agent['channel_id'], {}).get('name', '?')}"
+                    if agent.get("channel_id") else "all channels"
+                )
+                self._write_system(
+                    f"@{agent['display_name']} — trigger={agent['trigger_mode']}, scope={scope}"
+                )
+            return
+        if sub == "remove":
+            if len(args) < 2:
+                self._write_system("[red]usage: /agent remove <name>[/red]")
+                return
+            name = args[1]
+            match = next(
+                (a for a in state.agents.values() if a["display_name"] == name), None
+            )
+            if not match:
+                self._write_system(f"[red]no agent named @{name}[/red]")
+                return
+            try:
+                await http_delete_agent(
+                    state.cached.server_url,
+                    state.cached.member_token,
+                    state.cached.project_id,
+                    match["member_id"],
+                )
+            except ServerError as e:
+                self._write_system(f"[red]server error: {e}[/red]")
+                return
+            self._write_system(f"Removed agent @{name}.")
+            return
+        if sub == "add":
+            if len(args) < 3:
+                self._write_system(
+                    "[red]usage: /agent add <name> <trigger> [system-prompt][/red]"
+                )
+                return
+            name, trigger = args[1], args[2]
+            prompt = args[3] if len(args) > 3 else ""
+            try:
+                await http_create_agent(
+                    state.cached.server_url,
+                    state.cached.member_token,
+                    state.cached.project_id,
+                    display_name=name,
+                    system_prompt=prompt,
+                    trigger_mode=trigger,
+                    channel_id=self.current_channel_id,
+                )
+            except ServerError as e:
+                self._write_system(f"[red]server error: {e}[/red]")
+                return
+            if not state.api_key_registered:
+                self._write_system(
+                    "[yellow]Agent created. Register your Anthropic key with"
+                    " /api-key <sk-...> before it will respond.[/yellow]"
+                )
+            return
+        self._write_system(f"[red]unknown /agent subcommand: {sub}[/red]")
 
     def _guess_display_name(self) -> str:
         import os

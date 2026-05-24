@@ -35,6 +35,14 @@ CREATE TABLE IF NOT EXISTS app_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+-- Anthropic API keys are cached client-side so the TUI can re-supply them
+-- to the server on reconnect. Scoped per project so different projects can
+-- use different keys/billing accounts.
+CREATE TABLE IF NOT EXISTS api_keys (
+    project_id  TEXT PRIMARY KEY,
+    api_key     TEXT NOT NULL
+);
 """
 
 
@@ -122,4 +130,23 @@ class ClientCache:
             " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+        self._conn.commit()
+
+    def get_api_key(self, project_id: str) -> Optional[str]:
+        cur = self._conn.execute(
+            "SELECT api_key FROM api_keys WHERE project_id = ?", (project_id,)
+        )
+        row = cur.fetchone()
+        return row["api_key"] if row else None
+
+    def set_api_key(self, project_id: str, api_key: str) -> None:
+        self._conn.execute(
+            "INSERT INTO api_keys (project_id, api_key) VALUES (?, ?)"
+            " ON CONFLICT(project_id) DO UPDATE SET api_key = excluded.api_key",
+            (project_id, api_key),
+        )
+        self._conn.commit()
+
+    def clear_api_key(self, project_id: str) -> None:
+        self._conn.execute("DELETE FROM api_keys WHERE project_id = ?", (project_id,))
         self._conn.commit()

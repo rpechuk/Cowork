@@ -11,7 +11,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
-from cowork.shared.protocol import Channel, Member, Message, Project, UnreadState
+from cowork.shared.protocol import Agent, Channel, Member, Message, Project, TriggerMode, UnreadState
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 # Negative lookbehind keeps `email@here.com`, `https://x.com/@alice`, and
@@ -53,6 +53,32 @@ def new_token() -> str:
 
 def new_id() -> str:
     return uuid.uuid4().hex
+
+
+def _row_to_member(row: Any) -> Member:
+    return Member(
+        id=row["id"],
+        project_id=row["project_id"],
+        display_name=row["display_name"],
+        joined_at=row["joined_at"],
+        is_agent=bool(row["is_agent"]),
+    )
+
+
+def _row_to_agent(row: Any) -> Agent:
+    return Agent(
+        member_id=row["member_id"],
+        display_name=row["display_name"],
+        owner_member_id=row["owner_member_id"],
+        channel_id=row["channel_id"],
+        system_prompt=row["system_prompt"] or "",
+        trigger_mode=row["trigger_mode"],
+        model=row["model"],
+        created_at=row["created_at"],
+    )
+
+
+VALID_TRIGGER_MODES = {"always", "on_mention", "on_question"}
 
 
 class Database:
@@ -234,19 +260,20 @@ class Database:
 
     async def list_members(self, project_id: str) -> list[Member]:
         async with self.conn.execute(
-            "SELECT id, project_id, display_name, joined_at FROM project_members WHERE project_id = ?"
-            " ORDER BY joined_at",
+            "SELECT id, project_id, display_name, joined_at, is_agent FROM project_members"
+            " WHERE project_id = ? ORDER BY joined_at",
             (project_id,),
         ) as cur:
-            return [Member(**dict(row)) async for row in cur]
+            return [_row_to_member(row) async for row in cur]
 
     async def get_member(self, member_id: str) -> Optional[Member]:
         async with self.conn.execute(
-            "SELECT id, project_id, display_name, joined_at FROM project_members WHERE id = ?",
+            "SELECT id, project_id, display_name, joined_at, is_agent FROM project_members"
+            " WHERE id = ?",
             (member_id,),
         ) as cur:
             row = await cur.fetchone()
-        return Member(**dict(row)) if row else None
+        return _row_to_member(row) if row else None
 
     # ---- channels ----
 
@@ -500,3 +527,127 @@ class Database:
                 mentions = row["c"] if row else 0
             result[channel_id] = UnreadState(count=count, mentions=mentions)
         return result
+
+    # ---- agents ----
+
+    async def create_agent(
+        self,
+        project_id: str,
+        owner_member_id: str,
+        display_name: str,
+        system_prompt: str,
+        trigger_mode: str,
+        model: Optional[str],
+        channel_id: Optional[str],
+    ) -> Agent:
+        validate_display_name(display_name)
+        if trigger_mode not in VALID_TRIGGER_MODES:
+            raise ValueError(
+                f"trigger_mode must be one of {sorted(VALID_TRIGGER_MODES)}"
+            )
+        if channel_id is not None:
+            channel = await self.get_channel(channel_id)
+            if not channel or channel.project_id != project_id:
+                raise ValueError("channel not in this project")
+        owner = await self.get_member(owner_member_id)
+        if not owner or owner.project_id != project_id:
+            raise ValueError("owner is not a member of this project")
+        if owner.is_agent:
+            raise ValueError("agents cannot own other agents")
+        member_id = new_id()
+        now = time.time()
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "INSERT INTO project_members (id, project_id, display_name, joined_at, is_agent)"
+                    " VALUES (?, ?, ?, ?, 1)",
+                    (member_id, project_id, display_name, now),
+                )
+                await self.conn.execute(
+                    "INSERT INTO agents (member_id, owner_member_id, channel_id,"
+                    " system_prompt, trigger_mode, model, created_at)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        member_id,
+                        owner_member_id,
+                        channel_id,
+                        system_prompt,
+                        trigger_mode,
+                        model,
+                        now,
+                    ),
+                )
+                await self.conn.commit()
+            except aiosqlite.IntegrityError as e:
+                await self.conn.rollback()
+                raise ValueError(
+                    f"display name '{display_name}' already taken in this project"
+                ) from e
+            except Exception:
+                await self.conn.rollback()
+                raise
+        return Agent(
+            member_id=member_id,
+            display_name=display_name,
+            owner_member_id=owner_member_id,
+            channel_id=channel_id,
+            system_prompt=system_prompt,
+            trigger_mode=trigger_mode,  # type: ignore[arg-type]
+            model=model,
+            created_at=now,
+        )
+
+    async def delete_agent(self, project_id: str, member_id: str) -> bool:
+        async with self.conn.execute(
+            "SELECT pm.id FROM project_members pm WHERE pm.id = ? AND pm.project_id = ?"
+            " AND pm.is_agent = 1",
+            (member_id, project_id),
+        ) as cur:
+            if not await cur.fetchone():
+                return False
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "DELETE FROM project_members WHERE id = ?", (member_id,)
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+        return True
+
+    async def list_agents(self, project_id: str) -> list[Agent]:
+        async with self.conn.execute(
+            "SELECT a.member_id, pm.display_name, a.owner_member_id, a.channel_id,"
+            " a.system_prompt, a.trigger_mode, a.model, a.created_at"
+            " FROM agents a JOIN project_members pm ON pm.id = a.member_id"
+            " WHERE pm.project_id = ? ORDER BY a.created_at",
+            (project_id,),
+        ) as cur:
+            return [_row_to_agent(row) async for row in cur]
+
+    async def get_agent(self, member_id: str) -> Optional[Agent]:
+        async with self.conn.execute(
+            "SELECT a.member_id, pm.display_name, a.owner_member_id, a.channel_id,"
+            " a.system_prompt, a.trigger_mode, a.model, a.created_at"
+            " FROM agents a JOIN project_members pm ON pm.id = a.member_id"
+            " WHERE a.member_id = ?",
+            (member_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        return _row_to_agent(row) if row else None
+
+    async def list_agents_for_channel(
+        self, project_id: str, channel_id: str
+    ) -> list[Agent]:
+        """Agents that should listen to a given channel: those bound to that
+        channel plus project-wide (channel_id IS NULL) agents."""
+        async with self.conn.execute(
+            "SELECT a.member_id, pm.display_name, a.owner_member_id, a.channel_id,"
+            " a.system_prompt, a.trigger_mode, a.model, a.created_at"
+            " FROM agents a JOIN project_members pm ON pm.id = a.member_id"
+            " WHERE pm.project_id = ? AND (a.channel_id IS NULL OR a.channel_id = ?)"
+            " ORDER BY a.created_at",
+            (project_id, channel_id),
+        ) as cur:
+            return [_row_to_agent(row) async for row in cur]
