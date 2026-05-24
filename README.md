@@ -65,12 +65,23 @@ mention count.
 
 ### Copying text from the transcript
 
-Drag-select with the mouse in the transcript pane, then press **`ctrl+shift+c`**
-(or your terminal's normal copy keystroke). `ctrl+c` is intentionally **not**
-bound to quit so it can carry the selection to your clipboard. If your terminal
-still captures the mouse, hold **shift** while dragging — that bypasses
-Cowork's mouse handling. As a fallback, `/save-transcript` writes the current
-channel to a plain text file you can `cat` and copy.
+Drag-select with the mouse over the transcript, then press **`ctrl+c`**. Cowork
+ships the selection to your clipboard via the OSC 52 terminal escape and **also**
+writes a copy to `$COWORK_HOME/last-copy.txt` as a fallback, so even if your
+terminal blocks OSC 52 (macOS Terminal.app is the usual culprit; iTerm2,
+Windows Terminal, VS Code's integrated terminal, Alacritty, Kitty, and modern
+gnome-terminal all support it) you can recover the text with:
+
+```bash
+cat $COWORK_HOME/last-copy.txt | pbcopy   # macOS
+cat $COWORK_HOME/last-copy.txt | wl-copy  # Wayland
+```
+
+`/save-transcript [path]` is the heavier option that dumps the **entire**
+current channel to a file. Use it when you want grep-able conversation history
+rather than a single selection.
+
+Quitting: **`ctrl+q`** (or `/quit`). `ctrl+c` is reserved for the copy action.
 
 ## Protocol
 

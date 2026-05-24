@@ -246,6 +246,70 @@ async def test_ctrl_c_does_not_quit_so_terminal_can_copy_selection() -> None:
         assert app.is_running, "ctrl+c must not quit the app"
 
 
+async def test_ctrl_c_copies_screen_selection_even_with_input_focused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: dragging to select transcript text and pressing ctrl+c used
+    to fail because the Input widget's own ctrl+c binding (which copies the
+    Input's contents) intercepted the keystroke. Now we have a priority App
+    binding that calls action_copy_selection, which pulls the SCREEN selection
+    and ships it via copy_to_clipboard."""
+    captured: list[str] = []
+
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Intercept the copy-to-clipboard call so the test doesn't need a real
+        # terminal that honors OSC 52.
+        monkeypatch.setattr(
+            app, "copy_to_clipboard", lambda text: captured.append(text)
+        )
+        # Manually install a fake screen selection. We replace get_selected_text
+        # so we don't depend on the Textual internal selection state machinery.
+        scr = app.screen
+        monkeypatch.setattr(
+            scr, "get_selected_text", lambda: "the selected transcript text"
+        )
+        # Input has focus. Press ctrl+c.
+        from textual.widgets import Input
+
+        focused = app.focused
+        assert focused is not None and focused.id == "input"
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+    assert captured == ["the selected transcript text"], captured
+
+
+async def test_ctrl_c_writes_fallback_file_for_terminals_without_osc52(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """OSC 52 isn't universal (macOS Terminal.app, certain SSH chains). Whether
+    or not Textual's copy_to_clipboard succeeds, action_copy_selection also
+    writes the selection to $COWORK_HOME/last-copy.txt as a guaranteed
+    fallback."""
+    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        monkeypatch.setattr(app, "copy_to_clipboard", lambda text: None)
+        scr = app.screen
+        monkeypatch.setattr(scr, "get_selected_text", lambda: "fallback me")
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+    assert (tmp_path / "last-copy.txt").read_text() == "fallback me"
+
+
+async def test_ctrl_c_with_no_selection_does_not_crash() -> None:
+    """If the user presses ctrl+c with no drag-selection, the action notifies
+    them rather than crashing or doing something weird."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.is_running
+
+
 async def test_ctrl_q_quits_the_app() -> None:
     app = CoworkApp()
     async with app.run_test() as pilot:

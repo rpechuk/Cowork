@@ -43,13 +43,14 @@ HELP_TEXT = """[b]Cowork commands[/b]
 Type plain text to post to the current channel. Use [b]@name[/b] to mention.
 
 [b]Copying text[/b]
-  Drag with the mouse to select text in the transcript, then press [b]ctrl+shift+c[/b]
-  to copy it (this works in most terminals). If your terminal still captures the
-  mouse, hold [b]shift[/b] while you drag to bypass Cowork's mouse handling.
-  [b]/save-transcript[/b] writes the current channel to a file for easy copying.
+  Drag with the mouse over the transcript to select text, then press
+  [b]ctrl+c[/b] to copy. The clipboard ride uses OSC 52, which most terminals
+  honor; if yours doesn't (e.g. macOS Terminal.app), the same text is also
+  written to [b]$COWORK_HOME/last-copy.txt[/b] so you can pull it from there.
+  [b]/save-transcript[/b] writes the entire current channel to a file.
 
 [b]Exit[/b]
-  Press [b]ctrl+q[/b] to quit (ctrl+c is reserved so it can copy a selection).
+  Press [b]ctrl+q[/b] to quit, or type [b]/quit[/b].
 """
 
 
@@ -83,11 +84,13 @@ class CoworkApp(App):
     .mention { color: $warning; text-style: bold; }
     """
 
-    # Note: we deliberately do NOT bind ctrl+c. Textual uses it as the default
-    # "copy selection to clipboard" shortcut, and binding it here (especially
-    # with priority=True) would hijack the keystroke before a drag-selection
-    # copy can fire. Quit via ctrl+q or /quit.
+    # ctrl+c is bound to "copy current screen selection" with priority=True,
+    # which means it fires even when the input field is focused (otherwise the
+    # Input widget's own ctrl+c — which copies the input's own contents —
+    # would swallow the keystroke before our screen-selection copy could run).
+    # ctrl+q is the way to quit; /quit also works.
     BINDINGS = [
+        Binding("ctrl+c", "copy_selection", "Copy selection", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
         Binding("ctrl+i", "focus_input", "Focus input", show=False),
@@ -154,6 +157,40 @@ class CoworkApp(App):
             self.query_one("#input", Input).focus()
         except Exception:
             pass
+
+    def action_copy_selection(self) -> None:
+        """Copy the current screen-level text selection to clipboard.
+
+        Textual uses OSC 52 to ship text to the host terminal's clipboard,
+        which most modern terminals honor (iTerm2, Windows Terminal, VS Code,
+        Alacritty, Kitty, recent gnome-terminal). macOS Terminal.app and a
+        handful of others do NOT — so we also write the copied text to a
+        small file at $COWORK_HOME/last-copy.txt as a guaranteed fallback
+        the user can `cat | pbcopy` (or equivalent) if their clipboard
+        didn't update.
+        """
+        text = self.screen.get_selected_text()
+        if not text:
+            self.notify(
+                "Nothing selected. Drag with the mouse over the transcript first.",
+                severity="warning",
+                title="Copy",
+            )
+            return
+        self.copy_to_clipboard(text)
+        try:
+            from cowork.paths import data_dir
+
+            path = data_dir() / "last-copy.txt"
+            path.write_text(text, encoding="utf-8")
+            self.notify(
+                f"Copied {len(text)} chars. Backup at {path} (in case your"
+                " terminal blocks OSC 52).",
+                title="Copy",
+                timeout=4,
+            )
+        except OSError:
+            self.notify(f"Copied {len(text)} chars to clipboard.", title="Copy")
 
     async def on_unmount(self) -> None:
         for state in list(self.projects.values()):
