@@ -315,19 +315,23 @@ class CoworkApp(App):
             self._render_transcript()
         else:
             self._render_transcript()
-        # Mark read on the server only if we have a concrete message to anchor
-        # the read marker to. Sending mark_read with message_id=None would push
-        # last_read_at to wall-clock now and wipe unread for unseen history.
+        # ALWAYS send mark_read on channel switch — even with no message_id —
+        # so the server updates its per-session `focused_channel_id`. Without
+        # this signal, mention frames for the channel we just LEFT would stop
+        # being delivered to us (the server still thinks we're focused there).
+        # The server's db.mark_read no-ops the last_read_at update when
+        # message_id is None, so this is safe: we don't wipe unread for
+        # unseen history, we only update focus.
         msgs = state.messages_by_channel.get(channel_id) or []
-        if msgs:
-            asyncio.create_task(
-                state.connection.send(
-                    {
-                        "type": "mark_read",
-                        "data": {"channel_id": channel_id, "message_id": msgs[-1]["id"]},
-                    }
-                )
+        last_msg_id = msgs[-1]["id"] if msgs else None
+        asyncio.create_task(
+            state.connection.send(
+                {
+                    "type": "mark_read",
+                    "data": {"channel_id": channel_id, "message_id": last_msg_id},
+                }
             )
+        )
 
     def _refresh_tree(self) -> None:
         tree: Tree = self.query_one("#proj-tree", Tree)

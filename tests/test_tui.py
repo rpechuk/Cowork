@@ -286,6 +286,70 @@ async def test_legacy_two_arg_join_still_works(server: str, tmp_path: Path) -> N
         await _wait_for(lambda: bool(state.channels), timeout=5.0)
 
 
+async def test_channel_switch_updates_server_side_focus(server: str) -> None:
+    """Regression: switching to an empty channel didn't notify the server, so
+    mentions delivered to the *previous* channel after the switch were
+    suppressed (server still thought we were focused there). Now /channel <x>
+    always sends mark_read so focused_channel_id moves with the user."""
+    import json as _json
+
+    import httpx
+    import websockets
+
+    async with httpx.AsyncClient(base_url=server) as http:
+        r = await http.post(
+            "/projects",
+            json={"name": "p", "creator_display_name": "alice"},
+        )
+        alice = r.json()
+    bob_app = CoworkApp()
+    async with bob_app.run_test() as bob_pilot:
+        await bob_pilot.pause()
+        await _submit(
+            bob_pilot, f"/join {server} {alice['default_invite_token']} bob"
+        )
+        await _wait_for(lambda: bool(bob_app.projects), timeout=5.0)
+        bob_state = next(iter(bob_app.projects.values()))
+        await _wait_for(lambda: bool(bob_state.channels), timeout=5.0)
+        general_id = next(
+            cid for cid, ch in bob_state.channels.items() if ch["name"] == "general"
+        )
+
+        # Bob creates and switches to a fresh empty channel.
+        await _submit(bob_pilot, "/channel new other")
+        await _wait_for(
+            lambda: any(c["name"] == "other" for c in bob_state.channels.values()),
+            timeout=5.0,
+        )
+        await _submit(bob_pilot, "/channel other")
+        await asyncio.sleep(0.3)  # let the focus-update WS frame round-trip
+
+        # Alice (via raw WS) mentions Bob in #general — Bob is focused on
+        # #other so he should receive a `mention` frame, not just a regular
+        # message.
+        ws_url_alice = (
+            server.replace("http://", "ws://")
+            + f"/ws?token={alice['member_token']}&project_id={alice['project_id']}"
+        )
+        async with websockets.connect(ws_url_alice) as ws_a:
+            await ws_a.recv()  # drain hello
+            await ws_a.send(
+                _json.dumps(
+                    {
+                        "type": "send_message",
+                        "data": {
+                            "channel_id": general_id,
+                            "content": "@bob wake up",
+                        },
+                    }
+                )
+            )
+        await _wait_for(
+            lambda: bob_state.unread.get(general_id, (0, 0))[1] >= 1,
+            timeout=5.0,
+        )
+
+
 async def test_typed_text_reaches_input_widget_immediately() -> None:
     """Without the focus fix, keystrokes typed at app start would be eaten by
     the Tree widget instead of populating the Input."""
