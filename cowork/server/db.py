@@ -152,10 +152,15 @@ class Database:
         member_id = new_id()
         member_token = new_token()
         now = time.time()
-        await self.conn.execute(
-            "INSERT INTO project_members (id, project_id, display_name, joined_at) VALUES (?, ?, ?, ?)",
-            (member_id, project_id, display_name, now),
-        )
+        try:
+            await self.conn.execute(
+                "INSERT INTO project_members (id, project_id, display_name, joined_at) VALUES (?, ?, ?, ?)",
+                (member_id, project_id, display_name, now),
+            )
+        except aiosqlite.IntegrityError as e:
+            # Lost a race with another concurrent redemption of the same name.
+            await self.conn.rollback()
+            raise ValueError(f"display name '{display_name}' already taken in this project") from e
         await self.conn.execute(
             "INSERT INTO member_tokens (token_hash, member_id, created_at) VALUES (?, ?, ?)",
             (hash_token(member_token), member_id, now),
@@ -285,8 +290,11 @@ class Database:
 
     async def _resolve_mentions(self, project_id: str, content: str) -> list[Member]:
         names = {m.group(1) for m in MENTION_RE.finditer(content)}
-        special = {"here", "channel"} & names
-        names -= special
+        # MVP: @here and @channel both fan out to every project member. A future
+        # phase can scope @here to currently-connected members once we plumb
+        # connection-state into the DB layer.
+        broadcast = bool({"here", "channel"} & names)
+        names -= {"here", "channel"}
         members: list[Member] = []
         if names:
             placeholders = ",".join("?" for _ in names)
@@ -296,7 +304,7 @@ class Database:
                 (project_id, *names),
             ) as cur:
                 members = [Member(**dict(row)) async for row in cur]
-        if "channel" in special:
+        if broadcast:
             all_members = await self.list_members(project_id)
             seen = {m.id for m in members}
             members.extend(m for m in all_members if m.id not in seen)

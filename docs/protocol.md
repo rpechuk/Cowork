@@ -61,8 +61,9 @@ token to a project member. For every mentioned member who is not currently focus
 that channel, the server delivers a `mention` frame and updates the per-member
 `channel_reads` row. The client uses `mention` frames to ring the terminal bell.
 
-`@here` mentions every member currently connected to the project.
-`@channel` mentions every member of the project.
+`@channel` and `@here` both mention every member of the project. (In a later
+phase `@here` will be scoped to currently-connected members once we plumb
+live presence into the DB layer; for the MVP they are equivalent.)
 
 ## Auth
 

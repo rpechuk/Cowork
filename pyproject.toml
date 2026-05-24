@@ -27,3 +27,11 @@ packages = ["cowork"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "cowork/server/migrations" = "cowork/server/migrations"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::DeprecationWarning:websockets.*",
+    "ignore::DeprecationWarning:uvicorn.*",
+]
