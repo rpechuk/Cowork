@@ -1,0 +1,29 @@
+[project]
+name = "cowork"
+version = "0.1.0"
+description = "Multi-human, multi-agent collaborative chat wrapping the Claude Agent SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "aiosqlite>=0.20",
+    "pydantic>=2.7",
+    "textual>=0.79",
+    "httpx>=0.27",
+    "websockets>=13",
+    "platformdirs>=4.2",
+]
+
+[project.scripts]
+cowork = "cowork.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cowork"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"cowork/server/migrations" = "cowork/server/migrations"
