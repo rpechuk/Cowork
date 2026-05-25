@@ -53,6 +53,16 @@ class ConnectionManager:
     def sessions_for(self, project_id: str) -> list["ClientSession"]:
         return list(self._by_project.get(project_id, ()))
 
+    def is_member_connected(self, project_id: str, member_id: str) -> bool:
+        """True iff member_id currently has at least one live WS in this
+        project. Used to overlay 'offline' on top of each member's stored
+        status preference when nobody from that member is connected."""
+        bucket = self._by_project.get(project_id, ())
+        return any(s.member_id == member_id for s in bucket)
+
+    def connected_member_ids(self, project_id: str) -> set[str]:
+        return {s.member_id for s in self._by_project.get(project_id, ())}
+
 
 class ClientSession:
     def __init__(self, ws: WebSocket, member_id: str, project_id: str) -> None:
@@ -169,6 +179,7 @@ async def bootstrap(
     project_id: str,
     member: tuple[str, str] = Depends(bearer_member),
     db: Database = Depends(db_dep),
+    manager: ConnectionManager = Depends(conn_manager_dep),
 ):
     member_id, member_project = member
     if member_project != project_id:
@@ -178,6 +189,13 @@ async def bootstrap(
         raise HTTPException(status_code=404, detail="project not found")
     channels = await db.list_channels(project_id)
     members = await db.list_members(project_id)
+    # Overlay connection state on top of the stored status preference: any
+    # member not currently holding a WS shows up as 'offline' on the wire,
+    # regardless of what they last set via /status.
+    connected = manager.connected_member_ids(project_id)
+    for m in members:
+        if m.id not in connected:
+            m.status = "offline"
     unread = await db.unread_state(member_id, project_id)
     return BootstrapResponse(
         project=project,
@@ -189,6 +207,22 @@ async def bootstrap(
 
 
 # ---- WebSocket ----
+
+
+def _members_with_presence(
+    members: list, connected: set[str]
+) -> list[dict]:
+    """Take a list of Member rows + a set of currently-connected member IDs
+    and produce dicts whose `status` reflects connection state. A member
+    whose preference is e.g. 'busy' but who isn't currently connected ships
+    as 'offline'; on reconnect their stored 'busy' is broadcast again."""
+    out: list[dict] = []
+    for m in members:
+        d = m.model_dump()
+        if m.id not in connected:
+            d["status"] = "offline"
+        out.append(d)
+    return out
 
 
 async def _broadcast(manager: ConnectionManager, project_id: str, frame: dict) -> None:
@@ -334,11 +368,21 @@ async def ws_endpoint(
     member_id, _ = info
     await ws.accept()
     sess = ClientSession(ws, member_id, project_id)
+    # Was this member offline (no other live sockets) right before this
+    # connection landed? If yes, after we register the socket we'll
+    # broadcast their stored status preference so peers see them come
+    # online; if they had another tab/device already, nothing to announce.
+    was_offline = not manager.is_member_connected(project_id, member_id)
     await manager.add(sess)
     try:
         project = await db.get_project(project_id)
         channels = await db.list_channels(project_id)
         members = await db.list_members(project_id)
+        # Overlay 'offline' on every member with no live socket. The owner
+        # of `sess` is connected (we just added them), so their stored
+        # status carries through.
+        connected = manager.connected_member_ids(project_id)
+        members_payload = _members_with_presence(members, connected)
         await sess.send(
             {
                 "type": "hello",
@@ -346,10 +390,32 @@ async def ws_endpoint(
                     "project": project.model_dump() if project else None,
                     "member_id": member_id,
                     "channels": [c.model_dump() for c in channels],
-                    "members": [m.model_dump() for m in members],
+                    "members": members_payload,
                 },
             }
         )
+        if was_offline:
+            me = await db.get_member(member_id)
+            if me is not None:
+                # Only broadcast to peers, not to `sess` itself — the
+                # hello already told them their own status, and looping
+                # the message back can confuse single-client tests that
+                # don't drain past the hello before sending their first
+                # frame (the extra inbound frame stays in their recv
+                # buffer and is lost when they close the socket).
+                peers = [
+                    s for s in manager.sessions_for(project_id)
+                    if s is not sess
+                ]
+                if peers:
+                    frame = {
+                        "type": "member_status_changed",
+                        "data": {"member_id": member_id, "status": me.status},
+                    }
+                    await asyncio.gather(
+                        *(p.send(frame) for p in peers),
+                        return_exceptions=True,
+                    )
         while True:
             raw = await ws.receive_text()
             try:
@@ -410,3 +476,15 @@ async def ws_endpoint(
         pass
     finally:
         await manager.remove(sess)
+        # If this was the last live socket for the member, peers should
+        # see them flip to 'offline'. Multi-device users (another tab still
+        # open) stay at their stored status.
+        if not manager.is_member_connected(project_id, member_id):
+            await _broadcast(
+                manager,
+                project_id,
+                {
+                    "type": "member_status_changed",
+                    "data": {"member_id": member_id, "status": "offline"},
+                },
+            )

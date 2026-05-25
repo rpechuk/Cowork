@@ -347,6 +347,124 @@ async def test_alt_1_2_3_focus_each_panel() -> None:
         assert app.focused is not None and app.focused.id == "input"
 
 
+async def test_mac_option_key_chars_focus_panels() -> None:
+    """Default macOS Terminal.app / iTerm2 deliver Option+digit as a Unicode
+    character (Option+1='¡', Option+2='™', Option+3='£'), not as ESC+digit.
+    Cowork binds those characters in addition to alt+1/2/3 so Mac users
+    don't have to enable 'Use Option as Meta key' to get panel focus."""
+    from textual.containers import VerticalScroll
+    from textual.widgets import Tree
+
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("¡")
+        await pilot.pause()
+        assert isinstance(app.focused, Tree) and app.focused.id == "proj-tree"
+
+        await pilot.press("™")
+        await pilot.pause()
+        assert isinstance(app.focused, RichLog) and app.focused.id == "transcript"
+
+        await pilot.press("£")
+        await pilot.pause()
+        assert (
+            isinstance(app.focused, VerticalScroll)
+            and app.focused.id == "members-scroll"
+        )
+
+
+async def test_input_history_walks_back_with_up_arrow() -> None:
+    """↑ cycles back through previously-submitted lines; ↓ walks forward;
+    going past the newest entry restores whatever the user had been
+    drafting before they started navigating."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Populate history with three submissions (any non-empty text the
+        # input would accept; we don't need them to actually reach a server
+        # for this test — Input.Submitted is the only thing that records
+        # history).
+        for line in ("first", "second", "third"):
+            await _submit(pilot, line)
+            await pilot.pause()
+        inp = app.query_one("#input", Input)
+        assert app._input_history == ["first", "second", "third"]
+        # User starts drafting a new message.
+        inp.value = "drafty"
+        inp.cursor_position = len("drafty")
+
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.value == "third"
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.value == "second"
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.value == "first"
+        # Further ↑ at the oldest entry is a no-op.
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.value == "first"
+
+        # ↓ walks forward.
+        await pilot.press("down")
+        await pilot.pause()
+        assert inp.value == "second"
+        await pilot.press("down")
+        await pilot.pause()
+        assert inp.value == "third"
+        # Past the newest, the stashed draft is restored.
+        await pilot.press("down")
+        await pilot.pause()
+        assert inp.value == "drafty"
+        assert app._history_idx is None
+
+
+async def test_input_history_dedupes_repeated_submissions() -> None:
+    """Submitting the same line twice in a row should only add one entry
+    to the history list — otherwise ↑ ↑ ↑ would just bounce on the same
+    line."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        for line in ("hi", "hi", "hi", "bye"):
+            await _submit(pilot, line)
+            await pilot.pause()
+        assert app._input_history == ["hi", "bye"]
+
+
+async def test_arrow_keys_drive_autocomplete_before_history() -> None:
+    """When the autocomplete popup is open, ↑/↓ navigate it. Only with
+    the popup closed do the arrow keys walk the input history."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Seed history so ↑ has somewhere to go.
+        await _submit(pilot, "remember me")
+        await pilot.pause()
+        # Open the slash popup.
+        inp = app.query_one("#input", Input)
+        inp.value = "/"
+        inp.cursor_position = 1
+        app._refresh_autocomplete()
+        await pilot.pause()
+        assert app._ac_anchor is not None
+        # ↑ should NOT load 'remember me' — it moves the popup selection.
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.value == "/", inp.value
+        # Close the popup, then ↑ should load history.
+        await pilot.press("escape")
+        await pilot.pause()
+        inp.value = ""
+        inp.cursor_position = 0
+        await pilot.press("up")
+        await pilot.pause()
+        assert inp.value == "remember me"
+
+
 async def test_panel_labels_show_shortcut_keys() -> None:
     """Each panel has a small header label that names it and reveals its
     keyboard shortcut — so users don't have to dig through /help to find
@@ -470,6 +588,113 @@ async def test_manual_status_pins_and_blocks_auto_update(server: str) -> None:
         cur = state.members.get(state.cached.member_id, {}).get("status")
         assert cur == "busy", f"manual /status busy got overridden to {cur!r}"
         assert app._user_set_status is True
+
+
+async def test_member_goes_offline_when_their_session_closes(
+    server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When alice closes her client, bob (still connected to the same
+    project) should see her flip to 'offline' on the members panel.
+    When she relaunches the app, the server re-broadcasts her stored
+    status preference and bob sees her come back online."""
+    alice_home = tmp_path / "alice"
+    alice_home.mkdir()
+    bob_home = tmp_path / "bob"
+    bob_home.mkdir()
+
+    # 1) Alice creates the project and grabs an invite URL.
+    monkeypatch.setenv("COWORK_HOME", str(alice_home))
+    alice = CoworkApp()
+    async with alice.run_test() as alice_pilot:
+        await _submit(alice_pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(alice.projects), timeout=5.0)
+        await _submit(alice_pilot, "/invite")
+        await _wait_for(
+            lambda: "cowork://" in _transcript_text(alice), timeout=5.0
+        )
+        invite_url = (
+            "cowork://" + _transcript_text(alice).split("cowork://")[-1].split()[0]
+        )
+
+    # 2) Bob joins. With alice's app exited, the bootstrap should show her
+    # as 'offline' immediately — no waiting for a disconnect event because
+    # her WS was already gone before bob even logged in.
+    monkeypatch.setenv("COWORK_HOME", str(bob_home))
+    bob = CoworkApp()
+    async with bob.run_test() as bob_pilot:
+        await _submit(bob_pilot, f"/join {invite_url} bob")
+        await _wait_for(lambda: bool(bob.projects), timeout=5.0)
+        b_state = next(iter(bob.projects.values()))
+        await _wait_for(lambda: len(b_state.members) == 2, timeout=5.0)
+
+        alice_member = next(
+            m for m in b_state.members.values() if m["display_name"] == "alice"
+        )
+        alice_id = alice_member["id"]
+        await _wait_for(
+            lambda: b_state.members.get(alice_id, {}).get("status") == "offline",
+            timeout=5.0,
+        )
+
+        # 3) Alice relaunches her app. Bob should see her come back to
+        # online without bob having to reload — the server emits a
+        # member_status_changed broadcast on her first WS reconnect.
+        monkeypatch.setenv("COWORK_HOME", str(alice_home))
+        alice2 = CoworkApp()
+        async with alice2.run_test() as _:
+            await _wait_for(lambda: bool(alice2.projects), timeout=5.0)
+            await _wait_for(
+                lambda: b_state.members.get(alice_id, {}).get("status")
+                != "offline",
+                timeout=5.0,
+            )
+
+        # 4) Once alice2 exits, bob should see her flip back to 'offline'
+        # — confirms the disconnect path emits the broadcast too, not just
+        # bootstrap.
+        await _wait_for(
+            lambda: b_state.members.get(alice_id, {}).get("status") == "offline",
+            timeout=5.0,
+        )
+
+
+async def test_bootstrap_reports_disconnected_members_as_offline(
+    server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If alice has left the building and bob *then* logs in for the first
+    time, bob's bootstrap should already show alice as offline — the
+    server overlays the presence on top of her stored status preference."""
+    alice_home = tmp_path / "alice"
+    alice_home.mkdir()
+    bob_home = tmp_path / "bob"
+    bob_home.mkdir()
+
+    monkeypatch.setenv("COWORK_HOME", str(alice_home))
+    alice = CoworkApp()
+    invite_url: str
+    async with alice.run_test() as alice_pilot:
+        await _submit(alice_pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(alice.projects), timeout=5.0)
+        await _submit(alice_pilot, "/invite")
+        await _wait_for(
+            lambda: "cowork://" in _transcript_text(alice), timeout=5.0
+        )
+        invite_url = (
+            "cowork://" + _transcript_text(alice).split("cowork://")[-1].split()[0]
+        )
+    # alice's `async with` exited → her connection has been torn down.
+
+    monkeypatch.setenv("COWORK_HOME", str(bob_home))
+    bob = CoworkApp()
+    async with bob.run_test() as bob_pilot:
+        await _submit(bob_pilot, f"/join {invite_url} bob")
+        await _wait_for(lambda: bool(bob.projects), timeout=5.0)
+        b_state = next(iter(bob.projects.values()))
+        await _wait_for(lambda: len(b_state.members) == 2, timeout=5.0)
+        alice_member = next(
+            m for m in b_state.members.values() if m["display_name"] == "alice"
+        )
+        assert alice_member["status"] == "offline", alice_member
 
 
 async def test_status_command_rejects_unknown_preset(server: str) -> None:

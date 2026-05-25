@@ -67,6 +67,12 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
 # snappy; the work each tick is trivial.
 IDLE_AWAY_THRESHOLD_S = 120.0
 IDLE_CHECK_INTERVAL_S = 5.0
+
+# Cap how many submitted lines we remember for the ↑/↓ history. Generous
+# enough that a session's worth of commands stays reachable; small enough
+# that an attacker pasting megabytes can't hold the whole transcript in
+# memory through this path.
+INPUT_HISTORY_MAX = 200
 HELP_TEXT = """[b]Cowork commands[/b]
   Type [b]/[/b] in the input to open the command autocomplete; the menu
   filters as you type. Tab/Enter accepts the highlighted command. The full
@@ -91,8 +97,11 @@ HELP_TEXT = """[b]Cowork commands[/b]
   mentions — Tab/Enter accepts, Esc dismisses.
 
 [b]Panel navigation[/b]
-  Each panel's header shows its shortcut (e.g. [b]Channels  alt+1[/b]).
+  Each panel's header shows its shortcut. On Linux/Windows press [b]alt+1/2/3[/b];
+  on macOS press [b]Option+1/2/3[/b] (which sends ¡/™/£ — Cowork binds those too,
+  so it works without "Use Option as Meta key" enabled).
   [b]ctrl+i[/b] always snaps back to the input field.
+  [b]↑/↓[/b] in the input cycle through your message history.
 
 [b]Selecting and copying text[/b]
   Drag in the transcript to select. Mouse drag-tracking is off by default,
@@ -185,11 +194,29 @@ class CoworkApp(App):
         # code for digits — most terminals literally send "1"/"2"/"3" when
         # the user presses ctrl+1/2/3, so the binding never fires. Alt is
         # delivered as ESC+<key>, which terminals route reliably and Textual
-        # decodes as alt+1 / alt+2 / alt+3.
+        # decodes as alt+1 / alt+2 / alt+3. The macOS Option key with the
+        # default terminal settings emits a Unicode char instead (¡/™/£);
+        # those are intercepted in on_key below.
         Binding("alt+1", "focus_sidebar", "Sidebar", show=False),
         Binding("alt+2", "focus_transcript", "Transcript", show=False),
         Binding("alt+3", "focus_members", "Members", show=False),
     ]
+
+    # On default macOS terminal settings, Option+digit produces a literal
+    # Unicode character rather than ESC+digit. Textual exposes those chars
+    # as descriptive key names (inverted_exclamation_mark, trade_mark_sign,
+    # pound_sign), and binding them via the BINDINGS table doesn't fire
+    # consistently with the Input widget focused — so we intercept them in
+    # on_key. Both the literal character and the Textual-normalized name
+    # are matched, defensively.
+    MAC_OPTION_KEYS: dict[str, str] = {
+        "¡": "action_focus_sidebar",
+        "inverted_exclamation_mark": "action_focus_sidebar",
+        "™": "action_focus_transcript",
+        "trade_mark_sign": "action_focus_transcript",
+        "£": "action_focus_members",
+        "pound_sign": "action_focus_members",
+    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -218,6 +245,13 @@ class CoworkApp(App):
         # presence and stops the watchdog from second-guessing them.
         self._user_set_status: bool = False
         self._idle_task: Optional[asyncio.Task] = None
+        # ↑/↓ input history. _history_idx is None when the user is editing
+        # a fresh draft; otherwise it's a position inside _input_history.
+        # _history_draft stashes the in-progress text when the user starts
+        # walking ↑, so pressing ↓ past the newest entry restores it.
+        self._input_history: list[str] = []
+        self._history_idx: Optional[int] = None
+        self._history_draft: str = ""
 
     # ----- compose & mount -----
 
@@ -225,21 +259,21 @@ class CoworkApp(App):
         yield Header(show_clock=False)
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Static("Channels  alt+1", classes="panel-label")
+                yield Static("Channels  alt+1 / ⌥1", classes="panel-label")
                 yield Static("", id="mentions-feed", classes="empty")
                 with VerticalScroll(id="proj-tree-wrap"):
                     yield Tree("Projects", id="proj-tree")
             with Vertical(id="main"):
-                yield Static("Transcript  alt+2", classes="panel-label")
+                yield Static("Transcript  alt+2 / ⌥2", classes="panel-label")
                 yield RichLog(id="transcript", highlight=False, markup=True, wrap=True)
                 yield OptionList(id="autocomplete")
                 yield Static("", id="status")
                 yield Input(
-                    placeholder="Type a message — / for command, @ to mention",
+                    placeholder="Type a message — / for command, @ to mention, ↑/↓ for history",
                     id="input",
                 )
             with Vertical(id="members"):
-                yield Static("Members  alt+3", classes="panel-label")
+                yield Static("Members  alt+3 / ⌥3", classes="panel-label")
                 with VerticalScroll(id="members-scroll"):
                     yield Static("(no project)", id="members-list")
         yield Footer()
@@ -511,6 +545,49 @@ class CoworkApp(App):
         inp.value = new_value
         inp.cursor_position = new_cursor
 
+    # ----- input history (↑/↓) -----
+
+    def _history_back(self) -> bool:
+        """Step one entry back into the submission history. The first ↑
+        from a fresh draft stashes the in-progress text so ↓ can restore
+        it. Returns True iff the input value actually changed (so callers
+        know whether to prevent default key handling)."""
+        if not self._input_history:
+            return False
+        try:
+            inp = self.query_one("#input", Input)
+        except Exception:
+            return False
+        if self._history_idx is None:
+            self._history_draft = inp.value
+            self._history_idx = len(self._input_history) - 1
+        elif self._history_idx > 0:
+            self._history_idx -= 1
+        else:
+            return False  # already at oldest
+        inp.value = self._input_history[self._history_idx]
+        inp.cursor_position = len(inp.value)
+        return True
+
+    def _history_forward(self) -> bool:
+        """Step one entry forward in history. Past the newest entry we
+        restore the stashed draft (or empty) and exit history-walk mode."""
+        if self._history_idx is None:
+            return False
+        try:
+            inp = self.query_one("#input", Input)
+        except Exception:
+            return False
+        if self._history_idx < len(self._input_history) - 1:
+            self._history_idx += 1
+            inp.value = self._input_history[self._history_idx]
+        else:
+            self._history_idx = None
+            inp.value = self._history_draft
+            self._history_draft = ""
+        inp.cursor_position = len(inp.value)
+        return True
+
     def _autocomplete_move(self, delta: int) -> None:
         try:
             ac = self.query_one("#autocomplete", OptionList)
@@ -527,33 +604,55 @@ class CoworkApp(App):
         self._refresh_autocomplete()
 
     async def on_key(self, event: events.Key) -> None:
-        """Track activity for the idle watchdog, and intercept
-        Up/Down/Tab/Enter/Escape when the autocomplete popup is open so the
-        user can navigate it without losing focus on the input."""
+        """Track activity for the idle watchdog, drive the autocomplete
+        popup when it's open, and step through input history with ↑/↓
+        when it isn't."""
         self._last_activity = time.time()
         # Snap back to 'online' immediately on the next keystroke after
         # auto-away, rather than waiting up to IDLE_CHECK_INTERVAL_S for the
         # watchdog tick.
         if not self._user_set_status and self._my_status() == "away":
             asyncio.create_task(self._send_status("online"))
-        if not self._autocomplete_visible():
+        # Mac Option+digit fallback for default-config terminals (see the
+        # MAC_OPTION_KEYS table above).
+        action_name = self.MAC_OPTION_KEYS.get(event.key)
+        if action_name is not None:
+            handler = getattr(self, action_name, None)
+            if handler is not None:
+                handler()
+                event.prevent_default()
+                event.stop()
+                return
+        if self._autocomplete_visible():
+            if event.key == "down":
+                self._autocomplete_move(1)
+                event.prevent_default()
+                event.stop()
+            elif event.key == "up":
+                self._autocomplete_move(-1)
+                event.prevent_default()
+                event.stop()
+            elif event.key in ("tab", "enter"):
+                self._accept_autocomplete()
+                event.prevent_default()
+                event.stop()
+            elif event.key == "escape":
+                self._hide_autocomplete()
+                event.prevent_default()
+                event.stop()
             return
-        if event.key == "down":
-            self._autocomplete_move(1)
-            event.prevent_default()
-            event.stop()
-        elif event.key == "up":
-            self._autocomplete_move(-1)
-            event.prevent_default()
-            event.stop()
-        elif event.key in ("tab", "enter"):
-            self._accept_autocomplete()
-            event.prevent_default()
-            event.stop()
-        elif event.key == "escape":
-            self._hide_autocomplete()
-            event.prevent_default()
-            event.stop()
+        # No popup open — let ↑/↓ walk the input history (only when the
+        # input itself is focused; otherwise the keys belong to whichever
+        # widget is focused, e.g. tree navigation or transcript scroll).
+        if self.focused is not None and self.focused.id == "input":
+            if event.key == "up":
+                if self._history_back():
+                    event.prevent_default()
+                    event.stop()
+            elif event.key == "down":
+                if self._history_forward():
+                    event.prevent_default()
+                    event.stop()
 
     # ----- mouse-tracking helpers -----
 
@@ -1038,8 +1137,19 @@ class CoworkApp(App):
     async def _on_submit(self, event: Input.Submitted) -> None:
         text = event.value.strip()
         event.input.value = ""
+        # Always reset history navigation on submit: the next ↑ should
+        # walk from the newest entry, not the middle of a previous walk.
+        self._history_idx = None
+        self._history_draft = ""
         if not text:
             return
+        # Append to ↑/↓ history. Skip exact duplicates of the most recent
+        # entry to keep the list useful (typing 'hi' three times shouldn't
+        # eat three slots).
+        if not self._input_history or self._input_history[-1] != text:
+            self._input_history.append(text)
+            if len(self._input_history) > INPUT_HISTORY_MAX:
+                del self._input_history[: -INPUT_HISTORY_MAX]
         if text.startswith("/"):
             await self._handle_command(text)
         else:
