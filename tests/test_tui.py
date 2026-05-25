@@ -234,69 +234,16 @@ async def test_save_transcript_writes_a_file(server: str, tmp_path: Path) -> Non
         assert "@alice" in body
 
 
-async def test_ctrl_c_does_not_quit_so_terminal_can_copy_selection() -> None:
-    """Regression: ctrl+c used to be bound with priority=True, which hijacked
-    Textual's selection-copy keystroke. Now ctrl+q is the quit binding."""
+async def test_ctrl_c_quits_the_app() -> None:
+    """ctrl+c quits — matches the universal terminal convention. The user
+    relies on the terminal's own copy keystroke (cmd+c / ctrl+shift+c) for
+    selecting text from the transcript, so we don't reserve ctrl+c for copy."""
     app = CoworkApp()
     async with app.run_test() as pilot:
         await pilot.pause()
         await pilot.press("ctrl+c")
-        # Give the event loop a tick to process if anything was going to fire.
         await pilot.pause()
-        assert app.is_running, "ctrl+c must not quit the app"
-
-
-async def test_ctrl_c_copies_screen_selection_even_with_input_focused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Regression: dragging to select transcript text and pressing ctrl+c used
-    to fail because the Input widget's own ctrl+c binding (which copies the
-    Input's contents) intercepted the keystroke. Now we have a priority App
-    binding that calls action_copy_selection, which pulls the SCREEN selection
-    and ships it via copy_to_clipboard."""
-    captured: list[str] = []
-
-    app = CoworkApp()
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        # Intercept the copy-to-clipboard call so the test doesn't need a real
-        # terminal that honors OSC 52.
-        monkeypatch.setattr(
-            app, "copy_to_clipboard", lambda text: captured.append(text)
-        )
-        # Manually install a fake screen selection. We replace get_selected_text
-        # so we don't depend on the Textual internal selection state machinery.
-        scr = app.screen
-        monkeypatch.setattr(
-            scr, "get_selected_text", lambda: "the selected transcript text"
-        )
-        # Input has focus. Press ctrl+c.
-        from textual.widgets import Input
-
-        focused = app.focused
-        assert focused is not None and focused.id == "input"
-        await pilot.press("ctrl+c")
-        await pilot.pause()
-    assert captured == ["the selected transcript text"], captured
-
-
-async def test_ctrl_c_writes_fallback_file_for_terminals_without_osc52(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """OSC 52 isn't universal (macOS Terminal.app, certain SSH chains). Whether
-    or not Textual's copy_to_clipboard succeeds, action_copy_selection also
-    writes the selection to $COWORK_HOME/last-copy.txt as a guaranteed
-    fallback."""
-    monkeypatch.setenv("COWORK_HOME", str(tmp_path))
-    app = CoworkApp()
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        monkeypatch.setattr(app, "copy_to_clipboard", lambda text: None)
-        scr = app.screen
-        monkeypatch.setattr(scr, "get_selected_text", lambda: "fallback me")
-        await pilot.press("ctrl+c")
-        await pilot.pause()
-    assert (tmp_path / "last-copy.txt").read_text() == "fallback me"
+        assert not app.is_running, "ctrl+c must quit the app"
 
 
 async def test_ctrl_s_toggles_terminal_mouse_capture() -> None:
@@ -334,17 +281,6 @@ async def test_real_textual_driver_exposes_mouse_escape_write() -> None:
     assert hasattr(LinuxDriver, "flush")
 
 
-async def test_ctrl_c_with_no_selection_does_not_crash() -> None:
-    """If the user presses ctrl+c with no drag-selection, the action notifies
-    them rather than crashing or doing something weird."""
-    app = CoworkApp()
-    async with app.run_test() as pilot:
-        await pilot.pause()
-        await pilot.press("ctrl+c")
-        await pilot.pause()
-        assert app.is_running
-
-
 async def test_ctrl_q_quits_the_app() -> None:
     app = CoworkApp()
     async with app.run_test() as pilot:
@@ -363,6 +299,265 @@ async def test_richlog_allows_text_selection() -> None:
     async with app.run_test():
         log = app.query_one("#transcript", RichLog)
         assert log.allow_select is True
+
+
+# ---------------------------------------------------------------------------
+# Panel focus shortcuts
+# ---------------------------------------------------------------------------
+
+
+async def test_ctrl_1_2_3_focus_each_panel() -> None:
+    """Keyboard-only navigation: ctrl+1/2/3 jump focus to the three panels so
+    a user who never touches the mouse can still move around."""
+    from textual.containers import VerticalScroll
+    from textual.widgets import Tree
+
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Input has focus on mount.
+        assert app.focused is not None and app.focused.id == "input"
+
+        await pilot.press("ctrl+1")
+        await pilot.pause()
+        assert isinstance(app.focused, Tree) and app.focused.id == "proj-tree"
+
+        await pilot.press("ctrl+2")
+        await pilot.pause()
+        assert isinstance(app.focused, RichLog) and app.focused.id == "transcript"
+
+        await pilot.press("ctrl+3")
+        await pilot.pause()
+        assert isinstance(app.focused, VerticalScroll) and app.focused.id == "members"
+
+        await pilot.press("ctrl+i")
+        await pilot.pause()
+        assert app.focused is not None and app.focused.id == "input"
+
+
+# ---------------------------------------------------------------------------
+# /status command + member-status-changed propagation
+# ---------------------------------------------------------------------------
+
+
+async def test_status_command_updates_local_state_and_other_clients(
+    server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When alice runs /status away, bob (in the same project) sees alice's
+    status update reflected in his members panel. End-to-end through the
+    real server, real WS broadcast, real DB."""
+    alice_home = tmp_path / "alice"
+    alice_home.mkdir()
+    bob_home = tmp_path / "bob"
+    bob_home.mkdir()
+
+    monkeypatch.setenv("COWORK_HOME", str(alice_home))
+    alice = CoworkApp()
+    async with alice.run_test() as alice_pilot:
+        await _submit(alice_pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(alice.projects), timeout=5.0)
+        a_state = next(iter(alice.projects.values()))
+        await _wait_for(lambda: bool(a_state.channels), timeout=5.0)
+        await _submit(alice_pilot, "/invite")
+        await _wait_for(
+            lambda: "cowork://" in _transcript_text(alice), timeout=5.0
+        )
+        invite_url = "cowork://" + _transcript_text(alice).split("cowork://")[-1].split()[0]
+
+        monkeypatch.setenv("COWORK_HOME", str(bob_home))
+        bob = CoworkApp()
+        async with bob.run_test() as bob_pilot:
+            await _submit(bob_pilot, f"/join {invite_url} bob")
+            await _wait_for(lambda: bool(bob.projects), timeout=5.0)
+            b_state = next(iter(bob.projects.values()))
+            await _wait_for(lambda: len(b_state.members) == 2, timeout=5.0)
+
+            # alice flips to /status busy. bob should see it.
+            await _submit(alice_pilot, "/status busy")
+            await _wait_for(
+                lambda: any(
+                    m["display_name"] == "alice" and m.get("status") == "busy"
+                    for m in b_state.members.values()
+                ),
+                timeout=5.0,
+            )
+            # alice's own state should also reflect it.
+            await _wait_for(
+                lambda: a_state.members.get(a_state.cached.member_id, {}).get("status")
+                == "busy",
+                timeout=5.0,
+            )
+
+
+async def test_status_command_rejects_unknown_preset(server: str) -> None:
+    """The protocol enforces fixed presets server-side. Garbage doesn't get
+    accepted and the client surfaces an error."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        await _submit(pilot, "/status not-a-real-status")
+        # Local validation rejects it before it ever hits the wire.
+        assert "unknown status" in _transcript_text(app)
+
+
+# ---------------------------------------------------------------------------
+# @-mention autocomplete
+# ---------------------------------------------------------------------------
+
+
+async def test_at_autocomplete_appears_when_typing_at(server: str) -> None:
+    """Type '@' in the input → the autocomplete popup opens with member names."""
+    from textual.widgets import OptionList
+
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        state = next(iter(app.projects.values()))
+        await _wait_for(lambda: bool(state.channels), timeout=5.0)
+
+        inp = app.query_one("#input", Input)
+        inp.value = "hello @"
+        inp.cursor_position = len("hello @")
+        # Input.Changed fires off cursor moves/value sets only when value
+        # actually changes via user input; trigger refresh manually.
+        app._refresh_autocomplete()
+        await pilot.pause()
+
+        ac = app.query_one("#autocomplete", OptionList)
+        assert "visible" in ac.classes
+        # @here and @channel are always offered as broadcast tokens.
+        names = [opt.id for opt in [ac.get_option_at_index(i) for i in range(ac.option_count)]]
+        assert "here" in names
+        assert "channel" in names
+
+
+async def test_at_autocomplete_tab_inserts_selected_name(server: str) -> None:
+    """Tab accepts the highlighted option, replacing the partial @<text>
+    with the full @<name> + trailing space."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        state = next(iter(app.projects.values()))
+        await _wait_for(lambda: bool(state.channels), timeout=5.0)
+
+        inp = app.query_one("#input", Input)
+        # No other humans in the project yet, but @here is always offered.
+        inp.value = "hey @he"
+        inp.cursor_position = len("hey @he")
+        app._refresh_autocomplete()
+        await pilot.pause()
+
+        # Tab accepts the first match.
+        await pilot.press("tab")
+        await pilot.pause()
+        assert inp.value == "hey @here ", inp.value
+        # Popup is now hidden.
+        assert app._ac_anchor is None
+
+
+async def test_at_autocomplete_escape_dismisses(server: str) -> None:
+    """Escape closes the popup without modifying the input value."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        await _wait_for(
+            lambda: bool(next(iter(app.projects.values())).channels), timeout=5.0
+        )
+        inp = app.query_one("#input", Input)
+        inp.value = "@he"
+        inp.cursor_position = 3
+        app._refresh_autocomplete()
+        await pilot.pause()
+        assert app._ac_anchor is not None
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app._ac_anchor is None
+        # Input value unchanged.
+        assert inp.value == "@he"
+
+
+async def test_at_autocomplete_does_not_trigger_on_email(server: str) -> None:
+    """`alice@here.com` must NOT pop the autocomplete — the @ has to start a
+    word, matching the server's MENTION_RE rule."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        await _wait_for(
+            lambda: bool(next(iter(app.projects.values())).channels), timeout=5.0
+        )
+        inp = app.query_one("#input", Input)
+        inp.value = "ping alice@he"
+        inp.cursor_position = len(inp.value)
+        app._refresh_autocomplete()
+        await pilot.pause()
+        assert app._ac_anchor is None
+
+
+# ---------------------------------------------------------------------------
+# Recent-mentions feed
+# ---------------------------------------------------------------------------
+
+
+async def test_mentions_feed_records_recent_mentions(
+    server: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When bob @-mentions alice in a channel alice isn't viewing, the
+    mention shows up in the recent-@mentions feed on alice's left sidebar."""
+    alice_home = tmp_path / "alice"
+    alice_home.mkdir()
+    bob_home = tmp_path / "bob"
+    bob_home.mkdir()
+
+    monkeypatch.setenv("COWORK_HOME", str(alice_home))
+    alice = CoworkApp()
+    async with alice.run_test() as alice_pilot:
+        await _submit(alice_pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(alice.projects), timeout=5.0)
+        a_state = next(iter(alice.projects.values()))
+        await _wait_for(lambda: bool(a_state.channels), timeout=5.0)
+        # Create a second channel so alice can have something to NOT be focused on.
+        await _submit(alice_pilot, "/channel new random")
+        await _wait_for(
+            lambda: any(c["name"] == "random" for c in a_state.channels.values()),
+            timeout=5.0,
+        )
+        # alice switches to #random so #general is unfocused.
+        await _submit(alice_pilot, "/channel random")
+        await pilot_pause_brief()
+
+        await _submit(alice_pilot, "/invite")
+        await _wait_for(
+            lambda: "cowork://" in _transcript_text(alice), timeout=5.0
+        )
+        invite_url = "cowork://" + _transcript_text(alice).split("cowork://")[-1].split()[0]
+
+        monkeypatch.setenv("COWORK_HOME", str(bob_home))
+        bob = CoworkApp()
+        async with bob.run_test() as bob_pilot:
+            await _submit(bob_pilot, f"/join {invite_url} bob")
+            await _wait_for(lambda: bool(bob.projects), timeout=5.0)
+            b_state = next(iter(bob.projects.values()))
+            await _wait_for(lambda: bool(b_state.channels), timeout=5.0)
+            # bob posts @alice in #general; alice is NOT focused there → mention.
+            await _submit(bob_pilot, "@alice are you around?")
+            await _wait_for(
+                lambda: bool(a_state.recent_mentions),
+                timeout=5.0,
+            )
+            entry = a_state.recent_mentions[0]
+            assert entry["by_display_name"] == "bob"
+            assert "are you around" in entry["preview"]
+
+
+async def pilot_pause_brief() -> None:
+    """Short asyncio sleep — wrapper around what tests need when waiting for
+    a WS round-trip that has no observable predicate yet."""
+    await asyncio.sleep(0.15)
 
 
 async def test_legacy_two_arg_join_still_works(server: str, tmp_path: Path) -> None:

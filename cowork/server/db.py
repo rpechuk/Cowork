@@ -11,7 +11,14 @@ from typing import Any, Optional
 
 import aiosqlite
 
-from cowork.shared.protocol import Channel, Member, Message, Project, UnreadState
+from cowork.shared.protocol import (
+    MEMBER_STATUSES,
+    Channel,
+    Member,
+    Message,
+    Project,
+    UnreadState,
+)
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
 # Negative lookbehind keeps `email@here.com`, `https://x.com/@alice`, and
@@ -234,7 +241,8 @@ class Database:
 
     async def list_members(self, project_id: str) -> list[Member]:
         async with self.conn.execute(
-            "SELECT id, project_id, display_name, joined_at FROM project_members WHERE project_id = ?"
+            "SELECT id, project_id, display_name, joined_at, status"
+            " FROM project_members WHERE project_id = ?"
             " ORDER BY joined_at",
             (project_id,),
         ) as cur:
@@ -242,11 +250,33 @@ class Database:
 
     async def get_member(self, member_id: str) -> Optional[Member]:
         async with self.conn.execute(
-            "SELECT id, project_id, display_name, joined_at FROM project_members WHERE id = ?",
+            "SELECT id, project_id, display_name, joined_at, status"
+            " FROM project_members WHERE id = ?",
             (member_id,),
         ) as cur:
             row = await cur.fetchone()
         return Member(**dict(row)) if row else None
+
+    async def update_member_status(self, member_id: str, status: str) -> Member:
+        """Set a member's presence to one of the fixed presets."""
+        if status not in MEMBER_STATUSES:
+            raise ValueError(
+                f"status must be one of: {', '.join(MEMBER_STATUSES)}"
+            )
+        async with self._tx_lock:
+            try:
+                await self.conn.execute(
+                    "UPDATE project_members SET status = ? WHERE id = ?",
+                    (status, member_id),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+        member = await self.get_member(member_id)
+        if not member:
+            raise ValueError("member not found")
+        return member
 
     # ---- channels ----
 
@@ -361,7 +391,7 @@ class Database:
         if names:
             placeholders = ",".join("?" for _ in names)
             async with self.conn.execute(
-                f"SELECT id, project_id, display_name, joined_at FROM project_members"
+                f"SELECT id, project_id, display_name, joined_at, status FROM project_members"
                 f" WHERE project_id = ? AND display_name IN ({placeholders})",
                 (project_id, *names),
             ) as cur:

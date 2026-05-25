@@ -278,6 +278,26 @@ async def _handle_mark_read(sess: ClientSession, db: Database, data: dict) -> No
         )
 
 
+async def _handle_update_status(
+    sess: ClientSession,
+    db: Database,
+    manager: ConnectionManager,
+    data: dict,
+) -> None:
+    status = (data.get("status") or "").strip().lower()
+    if not status:
+        raise ValueError("status required")
+    member = await db.update_member_status(sess.member_id, status)
+    await _broadcast(
+        manager,
+        sess.project_id,
+        {
+            "type": "member_status_changed",
+            "data": {"member_id": member.id, "status": member.status},
+        },
+    )
+
+
 async def _handle_list_history(sess: ClientSession, db: Database, data: dict) -> None:
     channel_id = data.get("channel_id")
     if not channel_id:
@@ -345,7 +365,8 @@ async def ws_endpoint(
             ftype = frame.get("type")
             frame_id = frame.get("id") if isinstance(frame.get("id"), str) else None
             if ftype not in {
-                "send_message", "create_channel", "mark_read", "list_history", "ping"
+                "send_message", "create_channel", "mark_read",
+                "list_history", "update_status", "ping",
             }:
                 err = {"type": "error", "data": {"code": "unknown_type", "message": ftype or ""}}
                 if frame_id:
@@ -361,6 +382,8 @@ async def ws_endpoint(
                     await _handle_mark_read(sess, db, data)
                 elif ftype == "list_history":
                     await _handle_list_history(sess, db, data)
+                elif ftype == "update_status":
+                    await _handle_update_status(sess, db, manager, data)
                 elif ftype == "ping":
                     pong = {"type": "pong"}
                     if frame_id:

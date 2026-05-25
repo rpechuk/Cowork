@@ -5,6 +5,12 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 
+# Fixed presence presets — clients send one of these in `update_status`. The
+# server rejects anything else. Each has a fixed display color in the TUI.
+MemberStatus = Literal["online", "away", "busy", "offline"]
+MEMBER_STATUSES: tuple[str, ...] = ("online", "away", "busy", "offline")
+
+
 class Project(BaseModel):
     id: str
     name: str
@@ -16,6 +22,7 @@ class Member(BaseModel):
     project_id: str
     display_name: str
     joined_at: float
+    status: MemberStatus = "online"
 
 
 class Channel(BaseModel):

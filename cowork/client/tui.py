@@ -8,11 +8,12 @@ from datetime import datetime
 from typing import Optional
 
 from rich.text import Text
-from textual import on
+from textual import on, events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Footer, Header, Input, RichLog, Static, Tree
+from textual.widgets import Footer, Header, Input, OptionList, RichLog, Static, Tree
+from textual.widgets.option_list import Option
 from textual.widgets.tree import TreeNode
 
 from cowork.client.cache import CachedProject, ClientCache
@@ -26,40 +27,51 @@ from cowork.client.conn import (
 )
 from cowork.client.invite import format_invite, parse_invite
 from cowork.paths import client_db_path
+from cowork.shared.protocol import MEMBER_STATUSES
 
 logger = logging.getLogger("cowork.tui")
 
 DEFAULT_SERVER_URL = "http://127.0.0.1:8765"
+
+# Status preset → (dot character, color). The dot is rendered next to each
+# member's name in the right panel; the color is also used in the @mention
+# autocomplete entries and in the user's own status banner.
+STATUS_STYLE: dict[str, tuple[str, str]] = {
+    "online": ("●", "green"),
+    "away": ("●", "yellow"),
+    "busy": ("●", "red"),
+    "offline": ("○", "bright_black"),
+}
+RECENT_MENTIONS_KEEP = 5
 HELP_TEXT = """[b]Cowork commands[/b]
   /help                                — show this help
   /new-project <name>                  — create a new project on a server
   /join <server-url> <invite-token>    — join an existing project
-  /channel new <name>                  — create a new channel in the current project
+  /channel new <name>                  — create a new channel
   /channel <name>                      — switch to a channel
-  /invite                              — mint a fresh invite token for the current project
-  /save-transcript [path]              — write the current channel transcript to a file
+  /invite                              — mint a fresh invite token
+  /status <online|away|busy|offline>   — set your presence
+  /save-transcript [path]              — write the current channel to a file
   /leave-project                       — remove the current project from this device
   /quit                                — exit
-Type plain text to post to the current channel. Use [b]@name[/b] to mention.
+Type plain text to post to the current channel. Use [b]@name[/b] to mention;
+an autocomplete menu appears as you type — Tab/Enter to accept, Esc to dismiss.
+
+[b]Keyboard navigation[/b]
+  [b]ctrl+1[/b] focus projects/channels sidebar
+  [b]ctrl+2[/b] focus the transcript (page-up/down to scroll)
+  [b]ctrl+3[/b] focus the members panel
+  [b]ctrl+i[/b] focus the input field
 
 [b]Selecting and copying text[/b]
-  Text in the transcript is [b]always drag-selectable[/b] — just click and drag
-  with your mouse, then copy with your terminal's normal key:
-    macOS Terminal / iTerm2 : [b]cmd+c[/b]
-    GNOME / Konsole / Kitty  : [b]ctrl+shift+c[/b]
-    Windows Terminal         : [b]ctrl+shift+c[/b] or right-click → Copy
-
-  [b]ctrl+c[/b] also copies via the OSC 52 escape and writes to
-  [b]$COWORK_HOME/last-copy.txt[/b] as a fallback.
-
-  [b]ctrl+s[/b] toggles to "Full TUI mouse mode" (hover effects + drag scroll).
-  You almost never need this — it disables native text selection. The status
-  bar turns [b]orange[/b] while it is active. Press [b]ctrl+s[/b] again to return.
-
-  [b]/save-transcript[/b] dumps the entire current channel to a plain-text file.
+  Drag in the transcript to select. Mouse drag-tracking is off by default,
+  so the terminal does native selection. Copy with your terminal's own copy
+  key: [b]cmd+c[/b] (macOS), [b]ctrl+shift+c[/b] (most Linux terminals).
+  [b]ctrl+s[/b] toggles full TUI mouse mode (drag tracking on) if you want
+  hover effects — the status bar turns orange when active.
 
 [b]Exit[/b]
-  Press [b]ctrl+q[/b] to quit, or type [b]/quit[/b].
+  Press [b]ctrl+c[/b] or [b]ctrl+q[/b], or type [b]/quit[/b].
 """
 
 
@@ -77,6 +89,9 @@ class ProjectState:
     rendered_msg_ids: dict[str, set[str]] = field(default_factory=dict)
     unread: dict[str, tuple[int, int]] = field(default_factory=dict)
     status: str = "connecting"
+    # Most recent @mentions for this project (newest first), shown in the
+    # left-sidebar feed. Each entry: {channel_id, by_display_name, preview, ts}.
+    recent_mentions: list[dict] = field(default_factory=list)
 
 
 class CoworkApp(App):
@@ -84,34 +99,52 @@ class CoworkApp(App):
     Screen { layout: vertical; }
     #body { height: 1fr; }
     #sidebar { width: 28; border-right: solid $primary 50%; }
-    #members { width: 22; border-left: solid $primary 50%; }
+    #mentions-feed {
+        height: auto;
+        max-height: 8;
+        padding: 0 1;
+        border-bottom: solid $primary 30%;
+        background: $boost;
+    }
+    #mentions-feed.empty { display: none; }
+    #proj-tree-wrap { height: 1fr; }
+    #members { width: 24; border-left: solid $primary 50%; }
     #main { height: 1fr; }
     #transcript { height: 1fr; border: none; padding: 0 1; }
+    #autocomplete {
+        dock: bottom;
+        height: auto;
+        max-height: 8;
+        background: $boost;
+        border-top: solid $primary 50%;
+        display: none;
+    }
+    #autocomplete.visible { display: block; }
     #input { dock: bottom; }
     #status { height: 1; padding: 0 1; background: $boost; color: $text; }
     #status.tui-mouse-mode { background: $warning; color: $background; text-style: bold; }
     .muted { color: $text-muted; }
-    .mention { color: $warning; text-style: bold; }
     """
 
-    # By default Cowork disables terminal mouse-drag tracking (modes 1002/1003)
-    # so text in the transcript is always drag-selectable natively. Button
-    # clicks (mode 1000) and scroll-wheel still work so you can click channels
-    # and scroll with the wheel as normal.
+    # Cowork starts in "selection-friendly" mode: xterm drag modes 1002/1003
+    # are OFF so text in the transcript is drag-selectable via native terminal
+    # selection; mode 1000 (button clicks) and 1006 (SGR coords) stay on so
+    # sidebar clicks and scroll-wheel work. ctrl+s toggles full TUI mouse
+    # mode (drag tracking back on, status bar turns orange) for hover/drag
+    # interactions.
     #
-    # ctrl+s re-enables full TUI mouse mode (drag tracking back on) — needed
-    # only if you want hover highlights or drag-based scrolling. The status bar
-    # turns orange so you know you're in that mode. Press ctrl+s again to
-    # return to the always-selectable default.
-    #
-    # ctrl+c copies the current screen selection via OSC 52.
-    # ctrl+q (or /quit) exits.
+    # ctrl+c / ctrl+q quit. (No in-app copy binding — selecting + your
+    # terminal's own copy keystroke does the job.)
+    # ctrl+1/2/3 focus the sidebar / transcript / members panels.
     BINDINGS = [
         Binding("ctrl+s", "toggle_selection_mode", "TUI mouse mode"),
-        Binding("ctrl+c", "copy_selection", "Copy selection", priority=True),
+        Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
         Binding("ctrl+i", "focus_input", "Focus input", show=False),
+        Binding("ctrl+1", "focus_sidebar", "Sidebar", show=False),
+        Binding("ctrl+2", "focus_transcript", "Transcript", show=False),
+        Binding("ctrl+3", "focus_members", "Members", show=False),
     ]
 
     def __init__(self) -> None:
@@ -124,19 +157,25 @@ class CoworkApp(App):
         self._tree_node_for_project: dict[str, TreeNode] = {}
         self._server_url_hint = self.cache.get_state("last_server_url") or DEFAULT_SERVER_URL
         # Tracks whether full TUI mouse mode (drag tracking enabled) is active.
-        # False (the default) means drag tracking is OFF so text is always
-        # natively selectable; True means all mouse modes are on (hover, drag).
         self._mouse_capture_on: bool = False
+        # @-mention autocomplete state. _ac_anchor is the @-character index in
+        # the input buffer (None when no @ is being typed). _ac_options holds
+        # the member display names currently shown in the popup.
+        self._ac_anchor: Optional[int] = None
+        self._ac_options: list[str] = []
 
     # ----- compose & mount -----
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Horizontal(id="body"):
-            with VerticalScroll(id="sidebar"):
-                yield Tree("Projects", id="proj-tree")
+            with Vertical(id="sidebar"):
+                yield Static("", id="mentions-feed", classes="empty")
+                with VerticalScroll(id="proj-tree-wrap"):
+                    yield Tree("Projects", id="proj-tree")
             with Vertical(id="main"):
                 yield RichLog(id="transcript", highlight=False, markup=True, wrap=True)
+                yield OptionList(id="autocomplete")
                 yield Static("", id="status")
                 yield Input(placeholder="Type a message or /help", id="input")
             with VerticalScroll(id="members"):
@@ -184,6 +223,159 @@ class CoworkApp(App):
             self.query_one("#input", Input).focus()
         except Exception:
             pass
+
+    def action_focus_sidebar(self) -> None:
+        """Focus the projects/channels tree (ctrl+1)."""
+        try:
+            self.query_one("#proj-tree", Tree).focus()
+        except Exception:
+            pass
+
+    def action_focus_transcript(self) -> None:
+        """Focus the transcript so PageUp/PageDown scroll it (ctrl+2)."""
+        try:
+            self.query_one("#transcript", RichLog).focus()
+        except Exception:
+            pass
+
+    def action_focus_members(self) -> None:
+        """Focus the members panel container so it can scroll (ctrl+3)."""
+        try:
+            self.query_one("#members", VerticalScroll).focus()
+        except Exception:
+            pass
+
+    # ----- @ autocomplete -----
+
+    def _autocomplete_visible(self) -> bool:
+        return self._ac_anchor is not None
+
+    def _detect_mention(self, value: str, cursor: int) -> Optional[tuple[int, str]]:
+        """If the cursor is sitting inside an @<partial> token, return
+        (@-index, partial-name). Returns None otherwise. Skips email-like
+        substrings so '@here.com' in a URL doesn't trigger."""
+        i = cursor - 1
+        while i >= 0 and (value[i].isalnum() or value[i] in "_-"):
+            i -= 1
+        if i < 0 or value[i] != "@":
+            return None
+        # Same negative-lookbehind rule as MENTION_RE on the server: only
+        # treat @ as a mention sigil if it sits at the start of a word.
+        if i > 0 and (value[i - 1].isalnum() or value[i - 1] in "._-/"):
+            return None
+        return i, value[i + 1 : cursor]
+
+    def _refresh_autocomplete(self) -> None:
+        """Recompute the autocomplete popup based on what the user has typed."""
+        try:
+            inp = self.query_one("#input", Input)
+            ac = self.query_one("#autocomplete", OptionList)
+        except Exception:
+            return
+        if not self.current_project_id:
+            self._hide_autocomplete()
+            return
+        match = self._detect_mention(inp.value, inp.cursor_position)
+        if match is None:
+            self._hide_autocomplete()
+            return
+        anchor, partial = match
+        state = self.projects[self.current_project_id]
+        my_id = state.cached.member_id
+        partial_lower = partial.lower()
+        # Suggest other members + @here / @channel broadcast tokens.
+        names = [m["display_name"] for m in state.members.values() if m["id"] != my_id]
+        if partial_lower:
+            matches = [n for n in names if partial_lower in n.lower()]
+        else:
+            matches = names[:]
+        for special in ("here", "channel"):
+            if not partial_lower or partial_lower in special:
+                matches.append(special)
+        if not matches:
+            self._hide_autocomplete()
+            return
+        self._ac_anchor = anchor
+        self._ac_options = matches
+        ac.clear_options()
+        for name in matches:
+            ac.add_option(Option(f"@{name}", id=name))
+        ac.add_class("visible")
+        # Highlight the first option so Enter/Tab immediately accept it.
+        try:
+            ac.highlighted = 0
+        except Exception:
+            pass
+
+    def _hide_autocomplete(self) -> None:
+        self._ac_anchor = None
+        self._ac_options = []
+        try:
+            ac = self.query_one("#autocomplete", OptionList)
+            ac.remove_class("visible")
+            ac.clear_options()
+        except Exception:
+            pass
+
+    def _accept_autocomplete(self) -> None:
+        """Replace the partial @<text> at the anchor with the highlighted
+        option, then hide the popup."""
+        if self._ac_anchor is None or not self._ac_options:
+            return
+        try:
+            inp = self.query_one("#input", Input)
+            ac = self.query_one("#autocomplete", OptionList)
+        except Exception:
+            self._hide_autocomplete()
+            return
+        idx = ac.highlighted if ac.highlighted is not None else 0
+        if idx < 0 or idx >= len(self._ac_options):
+            idx = 0
+        name = self._ac_options[idx]
+        anchor = self._ac_anchor
+        cursor = inp.cursor_position
+        new_value = inp.value[:anchor] + f"@{name} " + inp.value[cursor:]
+        new_cursor = anchor + 1 + len(name) + 1
+        self._hide_autocomplete()
+        inp.value = new_value
+        inp.cursor_position = new_cursor
+
+    def _autocomplete_move(self, delta: int) -> None:
+        try:
+            ac = self.query_one("#autocomplete", OptionList)
+        except Exception:
+            return
+        count = ac.option_count
+        if count == 0:
+            return
+        cur = ac.highlighted if ac.highlighted is not None else 0
+        ac.highlighted = (cur + delta) % count
+
+    @on(Input.Changed, "#input")
+    def _on_input_changed(self, event: Input.Changed) -> None:
+        self._refresh_autocomplete()
+
+    async def on_key(self, event: events.Key) -> None:
+        """Intercept Up/Down/Tab/Enter/Escape when the @-autocomplete popup is
+        open, so the user can navigate it without losing focus on the input."""
+        if not self._autocomplete_visible():
+            return
+        if event.key == "down":
+            self._autocomplete_move(1)
+            event.prevent_default()
+            event.stop()
+        elif event.key == "up":
+            self._autocomplete_move(-1)
+            event.prevent_default()
+            event.stop()
+        elif event.key in ("tab", "enter"):
+            self._accept_autocomplete()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "escape":
+            self._hide_autocomplete()
+            event.prevent_default()
+            event.stop()
 
     # ----- mouse-tracking helpers -----
 
@@ -258,40 +450,6 @@ class CoworkApp(App):
                 title="TUI mouse mode",
                 timeout=5,
             )
-
-    def action_copy_selection(self) -> None:
-        """Copy the current screen-level text selection to clipboard.
-
-        Textual uses OSC 52 to ship text to the host terminal's clipboard,
-        which most modern terminals honor (iTerm2, Windows Terminal, VS Code,
-        Alacritty, Kitty, recent gnome-terminal). macOS Terminal.app and a
-        handful of others do NOT — so we also write the copied text to a
-        small file at $COWORK_HOME/last-copy.txt as a guaranteed fallback
-        the user can `cat | pbcopy` (or equivalent) if their clipboard
-        didn't update.
-        """
-        text = self.screen.get_selected_text()
-        if not text:
-            self.notify(
-                "Nothing selected. Drag with the mouse over the transcript first.",
-                severity="warning",
-                title="Copy",
-            )
-            return
-        self.copy_to_clipboard(text)
-        try:
-            from cowork.paths import data_dir
-
-            path = data_dir() / "last-copy.txt"
-            path.write_text(text, encoding="utf-8")
-            self.notify(
-                f"Copied {len(text)} chars. Backup at {path} (in case your"
-                " terminal blocks OSC 52).",
-                title="Copy",
-                timeout=4,
-            )
-        except OSError:
-            self.notify(f"Copied {len(text)} chars to clipboard.", title="Copy")
 
     async def on_unmount(self) -> None:
         for state in list(self.projects.values()):
@@ -389,10 +547,32 @@ class CoworkApp(App):
                     state.unread[cid] = (count, mentions + 1)
                     self._refresh_tree()
                 self.bell()
-                self._set_status(
-                    f"@mention from {data.get('by_display_name')} in #{state.channels.get(cid, {}).get('name', '?')}: "
-                    f"{data.get('preview', '')}"
+                # Push into the persistent feed on the left sidebar; also
+                # surface a one-line preview in the bottom status bar.
+                state.recent_mentions.insert(
+                    0,
+                    {
+                        "channel_id": cid,
+                        "by_display_name": data.get("by_display_name", "?"),
+                        "preview": data.get("preview", ""),
+                        "ts": data.get("ts"),
+                    },
                 )
+                del state.recent_mentions[RECENT_MENTIONS_KEEP:]
+                if self.current_project_id == project_id:
+                    self._refresh_mentions_feed()
+                channel_name = state.channels.get(cid, {}).get("name", "?")
+                self._set_status(
+                    f"@mention from {data.get('by_display_name')} in"
+                    f" #{channel_name}: {data.get('preview', '')}"
+                )
+            elif ftype == "member_status_changed":
+                mid = data.get("member_id")
+                new_status = data.get("status")
+                if mid and mid in state.members and isinstance(new_status, str):
+                    state.members[mid]["status"] = new_status
+                    if self.current_project_id == project_id:
+                        self._refresh_members_panel()
             elif ftype == "unread_update":
                 cid = data.get("channel_id")
                 if cid:
@@ -428,6 +608,7 @@ class CoworkApp(App):
             self.current_channel_id = None
             self._render_transcript()
             self._refresh_members_panel()
+        self._refresh_mentions_feed()
         self.cache.set_state("last_project_id", project_id)
         self.cache.set_state("last_server_url", state.cached.server_url)
 
@@ -506,10 +687,46 @@ class CoworkApp(App):
         text = Text()
         text.append(f"  #{channel['name']}", style="bold" if active else "")
         if mentions:
-            text.append(f"  (@{mentions})", style="bold yellow")
+            # Magenta + reverse video for the @N badge so it pops out as a
+            # callout — clearly distinct from the dim unread counter below.
+            text.append(f" @{mentions}", style="bold magenta reverse")
         elif count:
             text.append(f"  ({count})", style="dim")
         return text
+
+    def _refresh_mentions_feed(self) -> None:
+        """Render the recent-@mentions feed at the top of the left sidebar.
+        Hides the widget entirely when the list is empty so we don't waste
+        screen space on a header for nothing."""
+        try:
+            feed = self.query_one("#mentions-feed", Static)
+        except Exception:
+            return
+        if not self.current_project_id:
+            feed.update("")
+            feed.add_class("empty")
+            return
+        state = self.projects[self.current_project_id]
+        if not state.recent_mentions:
+            feed.update("")
+            feed.add_class("empty")
+            return
+        feed.remove_class("empty")
+        lines = [Text("@mentions", style="bold magenta")]
+        for m in state.recent_mentions:
+            cid = m.get("channel_id")
+            channel_name = state.channels.get(cid, {}).get("name", "?") if cid else "?"
+            t = Text()
+            t.append("• ", style="magenta")
+            t.append(f"@{m.get('by_display_name', '?')}", style="bold")
+            t.append(f" #{channel_name}", style="dim")
+            preview = (m.get("preview") or "").strip()
+            if preview:
+                if len(preview) > 24:
+                    preview = preview[:23] + "…"
+                t.append(f": {preview}", style="dim")
+            lines.append(t)
+        feed.update(Text("\n").join(lines))
 
     def _refresh_members_panel(self) -> None:
         panel: Static = self.query_one("#members-list", Static)
@@ -517,9 +734,21 @@ class CoworkApp(App):
             panel.update("(no project)")
             return
         state = self.projects[self.current_project_id]
-        lines = [Text("Members", style="bold underline"), Text("")]
+        my_member = state.members.get(state.cached.member_id) or {}
+        my_status = (my_member.get("status") or "online") if my_member else "online"
+        # Header includes the user's own status so they can see it at a glance.
+        header_text = Text("Members", style="bold underline")
+        my_dot, my_color = STATUS_STYLE.get(my_status, STATUS_STYLE["online"])
+        my_header = Text()
+        my_header.append("you: ", style="dim")
+        my_header.append(f"{my_dot} ", style=my_color)
+        my_header.append(my_status, style=my_color)
+        lines: list[Text] = [header_text, my_header, Text("")]
         for m in state.members.values():
+            status = m.get("status") or "online"
+            dot, color = STATUS_STYLE.get(status, STATUS_STYLE["online"])
             t = Text()
+            t.append(f"{dot} ", style=color)
             t.append(f"@{m['display_name']}")
             if m["id"] == state.cached.member_id:
                 t.append("  (you)", style="dim")
@@ -668,6 +897,8 @@ class CoworkApp(App):
             await self._cmd_leave_project()
         elif cmd == "save-transcript":
             await self._cmd_save_transcript(args)
+        elif cmd == "status":
+            await self._cmd_status(args)
         else:
             self._write_system(f"[red]unknown command: /{cmd}[/red] — try /help")
 
@@ -810,6 +1041,29 @@ class CoworkApp(App):
             self._refresh_members_panel()
         self._refresh_tree()
         self._write_system(f"Left {state.cached.project_name} on this device.")
+
+    async def _cmd_status(self, args: list[str]) -> None:
+        """Set the user's presence to one of the fixed presets. The server
+        validates and rejects anything outside MEMBER_STATUSES."""
+        if not self.current_project_id:
+            self._write_system("[red]no project selected[/red]")
+            return
+        if not args:
+            self._write_system(
+                f"[red]usage: /status <{' | '.join(MEMBER_STATUSES)}>[/red]"
+            )
+            return
+        new_status = args[0].strip().lower()
+        if new_status not in MEMBER_STATUSES:
+            self._write_system(
+                f"[red]unknown status '{new_status}'. choose one of:"
+                f" {', '.join(MEMBER_STATUSES)}[/red]"
+            )
+            return
+        state = self.projects[self.current_project_id]
+        await state.connection.send(
+            {"type": "update_status", "data": {"status": new_status}}
+        )
 
     async def _cmd_save_transcript(self, args: list[str]) -> None:
         """Write the current channel transcript to a file so users have a
