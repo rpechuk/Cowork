@@ -299,54 +299,39 @@ async def test_ctrl_c_writes_fallback_file_for_terminals_without_osc52(
     assert (tmp_path / "last-copy.txt").read_text() == "fallback me"
 
 
-async def test_ctrl_s_toggles_terminal_mouse_capture(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The fix for 'I can't select text with my mouse': ctrl+s drops the
-    terminal out of Textual's mouse-tracking mode so the user can drag-
-    select with their terminal natively. Pressing it again resumes capture."""
+async def test_ctrl_s_toggles_terminal_mouse_capture() -> None:
+    """By default Cowork starts in selection-friendly mode: drag tracking
+    (xterm modes 1002/1003) is disabled so native terminal text selection
+    works out of the box. ctrl+s toggles to full TUI mouse mode (drag
+    tracking on, orange status bar). Pressing it again restores the default."""
     app = CoworkApp()
     async with app.run_test() as pilot:
         await pilot.pause()
-        # Pilot's driver doesn't ship _disable/_enable; stub them so we can
-        # verify the toggle would actually call into the real driver methods
-        # on a real terminal.
-        calls: list[str] = []
-        driver = app._driver
-        assert driver is not None
-        monkeypatch.setattr(
-            driver,
-            "_disable_mouse_support",
-            lambda: calls.append("off"),
-            raising=False,
-        )
-        monkeypatch.setattr(
-            driver,
-            "_enable_mouse_support",
-            lambda: calls.append("on"),
-            raising=False,
-        )
-        assert app._mouse_capture_on is True
+        # Default state: selection-friendly (drag tracking off).
+        assert app._mouse_capture_on is False
+        status = app.query_one("#status")
+        assert "tui-mouse-mode" not in status.classes
 
+        # First ctrl+s: enable full TUI mouse mode.
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app._mouse_capture_on is True
+        assert "tui-mouse-mode" in status.classes
+
+        # Second ctrl+s: back to selection-friendly mode.
         await pilot.press("ctrl+s")
         await pilot.pause()
         assert app._mouse_capture_on is False
-        assert calls == ["off"]
-
-        await pilot.press("ctrl+s")
-        await pilot.pause()
-        assert app._mouse_capture_on is True
-        assert calls == ["off", "on"]
+        assert "tui-mouse-mode" not in status.classes
 
 
-async def test_real_textual_driver_exposes_mouse_toggles() -> None:
-    """Compile-time check that the methods we depend on (private API) still
-    exist on the production Textual driver. If Textual ever renames or
-    removes them, this test fails loudly and we can react."""
+async def test_real_textual_driver_exposes_mouse_escape_write() -> None:
+    """Compile-time check that the LinuxDriver still exposes write/flush so
+    our escape-sequence approach works on a real terminal."""
     from textual.drivers.linux_driver import LinuxDriver
 
-    assert hasattr(LinuxDriver, "_disable_mouse_support")
-    assert hasattr(LinuxDriver, "_enable_mouse_support")
+    assert hasattr(LinuxDriver, "write")
+    assert hasattr(LinuxDriver, "flush")
 
 
 async def test_ctrl_c_with_no_selection_does_not_crash() -> None:
