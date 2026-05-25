@@ -299,6 +299,56 @@ async def test_ctrl_c_writes_fallback_file_for_terminals_without_osc52(
     assert (tmp_path / "last-copy.txt").read_text() == "fallback me"
 
 
+async def test_ctrl_s_toggles_terminal_mouse_capture(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fix for 'I can't select text with my mouse': ctrl+s drops the
+    terminal out of Textual's mouse-tracking mode so the user can drag-
+    select with their terminal natively. Pressing it again resumes capture."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Pilot's driver doesn't ship _disable/_enable; stub them so we can
+        # verify the toggle would actually call into the real driver methods
+        # on a real terminal.
+        calls: list[str] = []
+        driver = app._driver
+        assert driver is not None
+        monkeypatch.setattr(
+            driver,
+            "_disable_mouse_support",
+            lambda: calls.append("off"),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            driver,
+            "_enable_mouse_support",
+            lambda: calls.append("on"),
+            raising=False,
+        )
+        assert app._mouse_capture_on is True
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app._mouse_capture_on is False
+        assert calls == ["off"]
+
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app._mouse_capture_on is True
+        assert calls == ["off", "on"]
+
+
+async def test_real_textual_driver_exposes_mouse_toggles() -> None:
+    """Compile-time check that the methods we depend on (private API) still
+    exist on the production Textual driver. If Textual ever renames or
+    removes them, this test fails loudly and we can react."""
+    from textual.drivers.linux_driver import LinuxDriver
+
+    assert hasattr(LinuxDriver, "_disable_mouse_support")
+    assert hasattr(LinuxDriver, "_enable_mouse_support")
+
+
 async def test_ctrl_c_with_no_selection_does_not_crash() -> None:
     """If the user presses ctrl+c with no drag-selection, the action notifies
     them rather than crashing or doing something weird."""

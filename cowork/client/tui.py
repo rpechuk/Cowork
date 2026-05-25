@@ -43,11 +43,16 @@ HELP_TEXT = """[b]Cowork commands[/b]
 Type plain text to post to the current channel. Use [b]@name[/b] to mention.
 
 [b]Copying text[/b]
-  Drag with the mouse over the transcript to select text, then press
-  [b]ctrl+c[/b] to copy. The clipboard ride uses OSC 52, which most terminals
-  honor; if yours doesn't (e.g. macOS Terminal.app), the same text is also
-  written to [b]$COWORK_HOME/last-copy.txt[/b] so you can pull it from there.
-  [b]/save-transcript[/b] writes the entire current channel to a file.
+  Press [b]ctrl+s[/b] to enter Selection Mode. Cowork releases the mouse so
+  your terminal can drag-select natively; copy with your terminal's normal
+  copy key (cmd+c on macOS, ctrl+shift+c on most Linux terminals, right-click
+  → Copy on Windows Terminal). Press [b]ctrl+s[/b] again to resume clicking
+  in the TUI.
+
+  As an alternative, [b]ctrl+c[/b] copies the current selection via the OSC 52
+  escape and also writes it to [b]$COWORK_HOME/last-copy.txt[/b] as a
+  fallback. [b]/save-transcript[/b] writes the entire current channel to a
+  file.
 
 [b]Exit[/b]
   Press [b]ctrl+q[/b] to quit, or type [b]/quit[/b].
@@ -84,12 +89,16 @@ class CoworkApp(App):
     .mention { color: $warning; text-style: bold; }
     """
 
-    # ctrl+c is bound to "copy current screen selection" with priority=True,
-    # which means it fires even when the input field is focused (otherwise the
-    # Input widget's own ctrl+c — which copies the input's own contents —
-    # would swallow the keystroke before our screen-selection copy could run).
-    # ctrl+q is the way to quit; /quit also works.
+    # ctrl+s toggles "selection mode": it disables Textual's terminal-level
+    # mouse capture so the terminal itself can do native click-drag selection
+    # and the terminal's own copy keystroke just works (cmd+c on macOS,
+    # ctrl+shift+c in most Linux terminals, right-click → Copy in others).
+    # Press it again to resume normal Textual interaction.
+    # ctrl+c is also bound to "copy current screen selection" with priority,
+    # for users whose terminals happily forward OSC 52.
+    # ctrl+q (or /quit) exits.
     BINDINGS = [
+        Binding("ctrl+s", "toggle_selection_mode", "Selection mode"),
         Binding("ctrl+c", "copy_selection", "Copy selection", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
@@ -105,6 +114,9 @@ class CoworkApp(App):
         self._tree_node_for_channel: dict[str, TreeNode] = {}
         self._tree_node_for_project: dict[str, TreeNode] = {}
         self._server_url_hint = self.cache.get_state("last_server_url") or DEFAULT_SERVER_URL
+        # Tracks whether the terminal is currently in mouse-capture mode.
+        # Flipped by action_toggle_selection_mode (ctrl+s).
+        self._mouse_capture_on: bool = True
 
     # ----- compose & mount -----
 
@@ -157,6 +169,69 @@ class CoworkApp(App):
             self.query_one("#input", Input).focus()
         except Exception:
             pass
+
+    def action_toggle_selection_mode(self) -> None:
+        """Toggle terminal mouse capture so the user can drag-select with
+        their terminal's native selection (which they can then copy with the
+        terminal's normal copy keystroke).
+
+        Why we need this: Textual puts the terminal into mouse-tracking mode
+        at startup so it can route clicks to widgets. While that's on, the
+        terminal stops doing native click-drag selection. The user is left
+        unable to select text the way they'd select text in any other shell.
+        Toggling capture off temporarily restores the normal behavior. When
+        the user is done copying, they toggle it back on to resume
+        clicking buttons / channels / tabs in the TUI.
+
+        Uses driver internals (`_disable_mouse_support` / `_enable_mouse_support`)
+        because Textual doesn't expose a public toggle in this version. The
+        escape sequences are the standard xterm ones, so this is portable.
+        """
+        driver = self._driver
+        if driver is None:
+            self.notify(
+                "Cannot toggle mouse — driver not available.",
+                severity="error",
+                title="Selection mode",
+            )
+            return
+        if self._mouse_capture_on:
+            disable = getattr(driver, "_disable_mouse_support", None)
+            if not callable(disable):
+                self.notify(
+                    "This driver doesn't support toggling mouse capture.",
+                    severity="error",
+                    title="Selection mode",
+                )
+                return
+            disable()
+            self._mouse_capture_on = False
+            self._set_status(
+                "SELECTION MODE — drag with mouse, copy via your terminal's"
+                " copy key (cmd+c / ctrl+shift+c). Press ctrl+s to resume."
+            )
+            self.notify(
+                "Mouse capture is OFF. Drag-select with your terminal and copy"
+                " normally. Press ctrl+s again to resume clicking in the TUI.",
+                title="Selection mode",
+                timeout=6,
+            )
+        else:
+            enable = getattr(driver, "_enable_mouse_support", None)
+            if not callable(enable):
+                self.notify(
+                    "Couldn't re-enable mouse capture (driver method missing).",
+                    severity="error",
+                    title="Selection mode",
+                )
+                return
+            enable()
+            self._mouse_capture_on = True
+            self._set_status("")
+            self.notify(
+                "Mouse capture is back ON. Click and scroll as normal.",
+                title="Selection mode",
+            )
 
     def action_copy_selection(self) -> None:
         """Copy the current screen-level text selection to clipboard.

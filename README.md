@@ -65,12 +65,27 @@ mention count.
 
 ### Copying text from the transcript
 
-Drag-select with the mouse over the transcript, then press **`ctrl+c`**. Cowork
-ships the selection to your clipboard via the OSC 52 terminal escape and **also**
-writes a copy to `$COWORK_HOME/last-copy.txt` as a fallback, so even if your
-terminal blocks OSC 52 (macOS Terminal.app is the usual culprit; iTerm2,
-Windows Terminal, VS Code's integrated terminal, Alacritty, Kitty, and modern
-gnome-terminal all support it) you can recover the text with:
+Like every TUI app, Cowork captures mouse events from the terminal so it can
+route clicks to buttons, channel names, etc. Side effect: your terminal stops
+doing its native click-drag selection while the app is running.
+
+**The reliable workaround**: press **`ctrl+s`** to drop into Selection Mode.
+Cowork releases the terminal mouse, so dragging now produces your terminal's
+own native selection and you can copy with the keystroke you're used to:
+
+| Terminal | Copy keystroke |
+|---|---|
+| iTerm2, Terminal.app (macOS) | `cmd+c` |
+| GNOME Terminal, Konsole, Alacritty, Kitty, xterm | `ctrl+shift+c` |
+| Windows Terminal | right-click → Copy, or `ctrl+shift+c` |
+| VS Code integrated terminal | `ctrl+c` / `cmd+c` |
+
+Press **`ctrl+s`** again to resume normal TUI clicking. The bottom status bar
+tells you which mode you're in.
+
+Alternative path: **`ctrl+c`** copies the current selection via the OSC 52
+escape AND writes it to `$COWORK_HOME/last-copy.txt`, so even if your
+terminal doesn't honor OSC 52 you can recover the text:
 
 ```bash
 cat $COWORK_HOME/last-copy.txt | pbcopy   # macOS
@@ -78,10 +93,10 @@ cat $COWORK_HOME/last-copy.txt | wl-copy  # Wayland
 ```
 
 `/save-transcript [path]` is the heavier option that dumps the **entire**
-current channel to a file. Use it when you want grep-able conversation history
-rather than a single selection.
+current channel to a file. Use it for grep-able conversation history rather
+than a single selection.
 
-Quitting: **`ctrl+q`** (or `/quit`). `ctrl+c` is reserved for the copy action.
+Quitting: **`ctrl+q`** (or `/quit`).
 
 ## Protocol
 
