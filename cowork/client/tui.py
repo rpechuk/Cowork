@@ -43,18 +43,10 @@ HELP_TEXT = """[b]Cowork commands[/b]
 Type plain text to post to the current channel. Use [b]@name[/b] to mention.
 
 [b]Selecting and copying text[/b]
-  Text in the transcript is [b]always drag-selectable[/b] — just click and drag
-  with your mouse, then copy with your terminal's normal key:
-    macOS Terminal / iTerm2 : [b]cmd+c[/b]
-    GNOME / Konsole / Kitty  : [b]ctrl+shift+c[/b]
-    Windows Terminal         : [b]ctrl+shift+c[/b] or right-click → Copy
-
-  [b]ctrl+c[/b] also copies via the OSC 52 escape and writes to
-  [b]$COWORK_HOME/last-copy.txt[/b] as a fallback.
-
-  [b]ctrl+s[/b] toggles to "Full TUI mouse mode" (hover effects + drag scroll).
-  You almost never need this — it disables native text selection. The status
-  bar turns [b]orange[/b] while it is active. Press [b]ctrl+s[/b] again to return.
+  Drag with the mouse over the transcript — Textual highlights the
+  selection. Then press [b]ctrl+c[/b] to copy. Cowork ships the text via
+  the OSC 52 escape (which most terminals honor) AND writes it to
+  [b]$COWORK_HOME/last-copy.txt[/b] as a guaranteed fallback.
 
   [b]/save-transcript[/b] dumps the entire current channel to a plain-text file.
 
@@ -89,25 +81,16 @@ class CoworkApp(App):
     #transcript { height: 1fr; border: none; padding: 0 1; }
     #input { dock: bottom; }
     #status { height: 1; padding: 0 1; background: $boost; color: $text; }
-    #status.tui-mouse-mode { background: $warning; color: $background; text-style: bold; }
     .muted { color: $text-muted; }
     .mention { color: $warning; text-style: bold; }
     """
 
-    # By default Cowork disables terminal mouse-drag tracking (modes 1002/1003)
-    # so text in the transcript is always drag-selectable natively. Button
-    # clicks (mode 1000) and scroll-wheel still work so you can click channels
-    # and scroll with the wheel as normal.
-    #
-    # ctrl+s re-enables full TUI mouse mode (drag tracking back on) — needed
-    # only if you want hover highlights or drag-based scrolling. The status bar
-    # turns orange so you know you're in that mode. Press ctrl+s again to
-    # return to the always-selectable default.
-    #
-    # ctrl+c copies the current screen selection via OSC 52.
+    # Text in the transcript is drag-selectable via Textual's built-in
+    # selection system (App.ALLOW_SELECT + RichLog.allow_select default to
+    # True in Textual 8.x). Drag with the mouse, then ctrl+c (action below)
+    # ships the selection to the clipboard via OSC 52 and a fallback file.
     # ctrl+q (or /quit) exits.
     BINDINGS = [
-        Binding("ctrl+s", "toggle_selection_mode", "TUI mouse mode"),
         Binding("ctrl+c", "copy_selection", "Copy selection", priority=True),
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
@@ -123,10 +106,6 @@ class CoworkApp(App):
         self._tree_node_for_channel: dict[str, TreeNode] = {}
         self._tree_node_for_project: dict[str, TreeNode] = {}
         self._server_url_hint = self.cache.get_state("last_server_url") or DEFAULT_SERVER_URL
-        # Tracks whether full TUI mouse mode (drag tracking enabled) is active.
-        # False (the default) means drag tracking is OFF so text is always
-        # natively selectable; True means all mouse modes are on (hover, drag).
-        self._mouse_capture_on: bool = False
 
     # ----- compose & mount -----
 
@@ -153,11 +132,6 @@ class CoworkApp(App):
         # silently swallows every keystroke the user types — including the
         # /new-project command they need to connect.
         self.query_one("#input", Input).focus()
-        # Disable mouse-drag tracking (xterm modes 1002/1003) so the terminal
-        # does native text selection when the user drags. Mode 1000 (button
-        # press/release) and mode 1006 (SGR extended coords) are kept so
-        # sidebar clicks and scroll-wheel still work via Textual.
-        self._disable_drag_tracking()
         cached = self.cache.list_projects()
         if not cached:
             self._write_system(
@@ -184,80 +158,6 @@ class CoworkApp(App):
             self.query_one("#input", Input).focus()
         except Exception:
             pass
-
-    # ----- mouse-tracking helpers -----
-
-    def _disable_drag_tracking(self) -> None:
-        """Send xterm escape sequences to turn off drag/motion tracking modes
-        (1002 and 1003) while leaving button-click (1000) and SGR coords (1006)
-        active. This restores native terminal text selection via mouse drag."""
-        driver = self._driver
-        if driver is None:
-            return
-        try:
-            driver.write("\x1b[?1002l\x1b[?1003l")
-            driver.flush()
-        except Exception:
-            pass
-
-    def _enable_drag_tracking(self) -> None:
-        """Re-enable drag/motion tracking modes so Textual receives drag events
-        (hover highlights, drag-based scroll). While active, the terminal
-        forwards drag events to Textual instead of doing native text selection."""
-        driver = self._driver
-        if driver is None:
-            return
-        try:
-            driver.write("\x1b[?1002h\x1b[?1003h")
-            driver.flush()
-        except Exception:
-            pass
-
-    def action_toggle_selection_mode(self) -> None:
-        """Toggle full TUI mouse mode vs the default selection-friendly mode.
-
-        Default (selection-friendly): xterm drag modes 1002/1003 are OFF so
-        the terminal does native text selection when you drag the mouse. Button
-        clicks (mode 1000) and scroll-wheel still work — click channels, scroll
-        with the wheel, it all works without any toggle.
-
-        Full TUI mouse mode (ctrl+s): re-enables drag tracking so Textual gets
-        hover-highlight and drag-scroll events. While active the status bar
-        turns orange and native text selection no longer works. Press ctrl+s
-        again to return to the default selection-friendly state.
-        """
-        if self._mouse_capture_on:
-            self._disable_drag_tracking()
-            self._mouse_capture_on = False
-            try:
-                self.query_one("#status", Static).remove_class("tui-mouse-mode")
-            except Exception:
-                pass
-            self._set_status("")
-            self.notify(
-                "Selection mode restored — drag to select text, copy with"
-                " your terminal's copy key (cmd+c / ctrl+shift+c).",
-                title="Selection mode",
-                timeout=4,
-            )
-        else:
-            self._enable_drag_tracking()
-            self._mouse_capture_on = True
-            try:
-                self.query_one("#status", Static).add_class("tui-mouse-mode")
-            except Exception:
-                pass
-            self._set_status(
-                "■ TUI MOUSE MODE — full mouse active, text cannot be"
-                " drag-selected. Press ctrl+s to restore."
-            )
-            self.notify(
-                "Full TUI mouse mode on. Hover + drag-scroll active, but"
-                " text can no longer be natively selected."
-                " Press ctrl+s to restore.",
-                title="TUI mouse mode",
-                timeout=5,
-            )
 
     def action_copy_selection(self) -> None:
         """Copy the current screen-level text selection to clipboard.

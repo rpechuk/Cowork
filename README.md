@@ -65,27 +65,15 @@ mention count.
 
 ### Copying text from the transcript
 
-Like every TUI app, Cowork captures mouse events from the terminal so it can
-route clicks to buttons, channel names, etc. Side effect: your terminal stops
-doing its native click-drag selection while the app is running.
+Drag with the mouse over the transcript. Textual highlights the
+selection in-app — this is Textual's own selection mechanism, not the
+terminal's, so it works regardless of what platform you're on.
 
-**The reliable workaround**: press **`ctrl+s`** to drop into Selection Mode.
-Cowork releases the terminal mouse, so dragging now produces your terminal's
-own native selection and you can copy with the keystroke you're used to:
-
-| Terminal | Copy keystroke |
-|---|---|
-| iTerm2, Terminal.app (macOS) | `cmd+c` |
-| GNOME Terminal, Konsole, Alacritty, Kitty, xterm | `ctrl+shift+c` |
-| Windows Terminal | right-click → Copy, or `ctrl+shift+c` |
-| VS Code integrated terminal | `ctrl+c` / `cmd+c` |
-
-Press **`ctrl+s`** again to resume normal TUI clicking. The bottom status bar
-tells you which mode you're in.
-
-Alternative path: **`ctrl+c`** copies the current selection via the OSC 52
-escape AND writes it to `$COWORK_HOME/last-copy.txt`, so even if your
-terminal doesn't honor OSC 52 you can recover the text:
+Press **`ctrl+c`** to copy. Cowork ships the text via the OSC 52 escape
+(honored by iTerm2, Windows Terminal, VS Code's terminal, Alacritty,
+Kitty, recent gnome-terminal) AND writes it to
+`$COWORK_HOME/last-copy.txt` as a guaranteed fallback for terminals
+(e.g. macOS Terminal.app) that don't honor OSC 52:
 
 ```bash
 cat $COWORK_HOME/last-copy.txt | pbcopy   # macOS
