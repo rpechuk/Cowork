@@ -33,9 +33,16 @@ async def _wait_for(condition, timeout: float = 3.0, interval: float = 0.05) -> 
 
 
 async def _submit(pilot, text: str) -> None:
-    """Type `text` into the input box and press Enter, the way a user would."""
+    """Type `text` into the input box and press Enter, the way a user would.
+    Mirrors real typing by parking the cursor at end-of-value (otherwise
+    the autocomplete sees an empty partial at position 0 and pops a menu
+    that swallows the Enter press)."""
     inp = pilot.app.query_one("#input", Input)
     inp.value = text
+    inp.cursor_position = len(text)
+    # Bare value-set in Textual fires Input.Changed asynchronously; settle
+    # before pressing enter so the autocomplete refresh sees the real value.
+    await pilot.pause()
     await pilot.press("enter")
     # Give async handlers a tick to run.
     await pilot.pause()
@@ -306,9 +313,11 @@ async def test_richlog_allows_text_selection() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_ctrl_1_2_3_focus_each_panel() -> None:
-    """Keyboard-only navigation: ctrl+1/2/3 jump focus to the three panels so
-    a user who never touches the mouse can still move around."""
+async def test_alt_1_2_3_focus_each_panel() -> None:
+    """Keyboard-only navigation: alt+1/2/3 jump focus to the three panels so
+    a user who never touches the mouse can still move around. (alt rather
+    than ctrl because ASCII has no control codes for digits — most
+    terminals literally send '1'/'2'/'3' for ctrl+digit.)"""
     from textual.containers import VerticalScroll
     from textual.widgets import Tree
 
@@ -318,21 +327,38 @@ async def test_ctrl_1_2_3_focus_each_panel() -> None:
         # Input has focus on mount.
         assert app.focused is not None and app.focused.id == "input"
 
-        await pilot.press("ctrl+1")
+        await pilot.press("alt+1")
         await pilot.pause()
         assert isinstance(app.focused, Tree) and app.focused.id == "proj-tree"
 
-        await pilot.press("ctrl+2")
+        await pilot.press("alt+2")
         await pilot.pause()
         assert isinstance(app.focused, RichLog) and app.focused.id == "transcript"
 
-        await pilot.press("ctrl+3")
+        await pilot.press("alt+3")
         await pilot.pause()
-        assert isinstance(app.focused, VerticalScroll) and app.focused.id == "members"
+        assert (
+            isinstance(app.focused, VerticalScroll)
+            and app.focused.id == "members-scroll"
+        )
 
         await pilot.press("ctrl+i")
         await pilot.pause()
         assert app.focused is not None and app.focused.id == "input"
+
+
+async def test_panel_labels_show_shortcut_keys() -> None:
+    """Each panel has a small header label that names it and reveals its
+    keyboard shortcut — so users don't have to dig through /help to find
+    out how to move around."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        labels = [s.render() for s in app.query(".panel-label")]
+        text = " | ".join(str(r) for r in labels)
+        assert "alt+1" in text
+        assert "alt+2" in text
+        assert "alt+3" in text
 
 
 # ---------------------------------------------------------------------------
@@ -387,6 +413,63 @@ async def test_status_command_updates_local_state_and_other_clients(
                 == "busy",
                 timeout=5.0,
             )
+
+
+async def test_auto_status_flips_to_away_when_idle(server: str) -> None:
+    """When keyboard activity stops for longer than the idle threshold the
+    watchdog flips the user from online → away on the server, which
+    broadcasts the change back to our own client. The very next keystroke
+    flips it back to online."""
+    app = CoworkApp()
+    # Tighten the watchdog so the test doesn't have to wait two minutes.
+    app._idle_threshold_s = 0.2
+    app._idle_check_interval_s = 0.05
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        state = next(iter(app.projects.values()))
+        await _wait_for(lambda: bool(state.channels), timeout=5.0)
+        my_id = state.cached.member_id
+        # Wait for the watchdog to notice idleness and flip us to 'away'.
+        # (Project setup itself takes long enough to exceed the 0.2s
+        # threshold, so this should happen within a tick or two.)
+        await _wait_for(
+            lambda: state.members.get(my_id, {}).get("status") == "away",
+            timeout=5.0,
+        )
+        # Pin the threshold high enough that the watchdog won't immediately
+        # re-flip us to away after the snap-back — otherwise the test races
+        # against itself in the ~0.2s window before idle exceeds threshold.
+        app._idle_threshold_s = 60.0
+        await pilot.press("a")
+        await _wait_for(
+            lambda: state.members.get(my_id, {}).get("status") == "online",
+            timeout=5.0,
+        )
+
+
+async def test_manual_status_pins_and_blocks_auto_update(server: str) -> None:
+    """After /status busy, the idle watchdog must NOT silently flip the
+    user to away. Manual presence wins."""
+    app = CoworkApp()
+    app._idle_threshold_s = 0.2
+    app._idle_check_interval_s = 0.05
+    async with app.run_test() as pilot:
+        await _submit(pilot, f"/new-project demo {server} alice")
+        await _wait_for(lambda: bool(app.projects), timeout=5.0)
+        state = next(iter(app.projects.values()))
+        await _wait_for(lambda: bool(state.channels), timeout=5.0)
+        await _submit(pilot, "/status busy")
+        await _wait_for(
+            lambda: state.members.get(state.cached.member_id, {}).get("status")
+            == "busy",
+            timeout=5.0,
+        )
+        # Sit still well past the idle threshold; status should NOT change.
+        await asyncio.sleep(0.6)
+        cur = state.members.get(state.cached.member_id, {}).get("status")
+        assert cur == "busy", f"manual /status busy got overridden to {cur!r}"
+        assert app._user_set_status is True
 
 
 async def test_status_command_rejects_unknown_preset(server: str) -> None:
@@ -478,6 +561,79 @@ async def test_at_autocomplete_escape_dismisses(server: str) -> None:
         assert app._ac_anchor is None
         # Input value unchanged.
         assert inp.value == "@he"
+
+
+async def test_slash_autocomplete_lists_commands(server: str) -> None:
+    """Typing '/' at the start of input opens the autocomplete with the
+    full command list; typing more characters filters it down."""
+    from textual.widgets import OptionList
+
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", Input)
+        inp.value = "/"
+        inp.cursor_position = 1
+        app._refresh_autocomplete()
+        await pilot.pause()
+
+        ac = app.query_one("#autocomplete", OptionList)
+        assert "visible" in ac.classes
+        assert app._ac_mode == "slash"
+        ids = [ac.get_option_at_index(i).id for i in range(ac.option_count)]
+        assert "help" in ids and "status" in ids and "quit" in ids
+
+        # Filter to commands starting with 's'.
+        inp.value = "/s"
+        inp.cursor_position = 2
+        app._refresh_autocomplete()
+        await pilot.pause()
+        ids = [ac.get_option_at_index(i).id for i in range(ac.option_count)]
+        assert ids == ["status", "save-transcript"]
+
+
+async def test_slash_autocomplete_tab_inserts_command(server: str) -> None:
+    """Tab on the slash popup replaces the partial command with the full
+    one plus a trailing space, ready for the user to keep typing args."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", Input)
+        inp.value = "/sta"
+        inp.cursor_position = 4
+        app._refresh_autocomplete()
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        assert inp.value == "/status ", inp.value
+        assert app._ac_anchor is None
+
+
+async def test_slash_autocomplete_hides_after_space(server: str) -> None:
+    """Once the user types past the command name (with a space), the popup
+    closes — they're now typing arguments, not picking a command."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", Input)
+        inp.value = "/status "
+        inp.cursor_position = len(inp.value)
+        app._refresh_autocomplete()
+        await pilot.pause()
+        assert app._ac_anchor is None
+
+
+async def test_slash_autocomplete_ignores_mid_message_slash() -> None:
+    """'/' is only a sigil at the start of input — 'do /it' must not pop."""
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        inp = app.query_one("#input", Input)
+        inp.value = "do /it"
+        inp.cursor_position = len(inp.value)
+        app._refresh_autocomplete()
+        await pilot.pause()
+        assert app._ac_anchor is None
 
 
 async def test_at_autocomplete_does_not_trigger_on_email(server: str) -> None:

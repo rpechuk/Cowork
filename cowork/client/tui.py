@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
@@ -43,25 +44,55 @@ STATUS_STYLE: dict[str, tuple[str, str]] = {
     "offline": ("○", "bright_black"),
 }
 RECENT_MENTIONS_KEEP = 5
+
+# The slash-command autocomplete reads from this single source-of-truth list
+# so the popup, the help text, and future docs all stay in sync. Each tuple
+# is (command-without-slash, one-line description).
+SLASH_COMMANDS: list[tuple[str, str]] = [
+    ("help", "show this help"),
+    ("new-project", "create a new project on a server"),
+    ("join", "join an existing project from an invite"),
+    ("channel", "switch to or create a channel"),
+    ("invite", "mint a fresh invite token"),
+    ("status", "set presence (online/away/busy/offline)"),
+    ("save-transcript", "write the current channel to a file"),
+    ("leave-project", "remove the current project from this device"),
+    ("quit", "exit"),
+]
+
+# Auto-away defaults. The idle watchdog flips the user from online → away
+# after IDLE_AWAY_THRESHOLD_S of no keyboard activity, and back to online on
+# the very next keystroke. Manually setting any /status pins the status and
+# disables auto-management. The check interval is short so transitions feel
+# snappy; the work each tick is trivial.
+IDLE_AWAY_THRESHOLD_S = 120.0
+IDLE_CHECK_INTERVAL_S = 5.0
 HELP_TEXT = """[b]Cowork commands[/b]
+  Type [b]/[/b] in the input to open the command autocomplete; the menu
+  filters as you type. Tab/Enter accepts the highlighted command. The full
+  list:
+
   /help                                — show this help
   /new-project <name>                  — create a new project on a server
   /join <server-url> <invite-token>    — join an existing project
   /channel new <name>                  — create a new channel
   /channel <name>                      — switch to a channel
   /invite                              — mint a fresh invite token
-  /status <online|away|busy|offline>   — set your presence
+  /status <online|away|busy|offline>   — set your presence (pins it; otherwise
+                                          Cowork flips you to 'away' after a
+                                          couple minutes idle and back on
+                                          activity)
   /save-transcript [path]              — write the current channel to a file
   /leave-project                       — remove the current project from this device
   /quit                                — exit
-Type plain text to post to the current channel. Use [b]@name[/b] to mention;
-an autocomplete menu appears as you type — Tab/Enter to accept, Esc to dismiss.
 
-[b]Keyboard navigation[/b]
-  [b]ctrl+1[/b] focus projects/channels sidebar
-  [b]ctrl+2[/b] focus the transcript (page-up/down to scroll)
-  [b]ctrl+3[/b] focus the members panel
-  [b]ctrl+i[/b] focus the input field
+  Plain text posts to the current channel. Use [b]@name[/b] to mention;
+  an autocomplete menu appears for both [b]/[/b] commands and [b]@[/b]
+  mentions — Tab/Enter accepts, Esc dismisses.
+
+[b]Panel navigation[/b]
+  Each panel's header shows its shortcut (e.g. [b]Channels  alt+1[/b]).
+  [b]ctrl+i[/b] always snaps back to the input field.
 
 [b]Selecting and copying text[/b]
   Drag in the transcript to select. Mouse drag-tracking is off by default,
@@ -99,6 +130,13 @@ class CoworkApp(App):
     Screen { layout: vertical; }
     #body { height: 1fr; }
     #sidebar { width: 28; border-right: solid $primary 50%; }
+    .panel-label {
+        height: 1;
+        padding: 0 1;
+        background: $primary 20%;
+        color: $text-muted;
+        text-style: bold;
+    }
     #mentions-feed {
         height: auto;
         max-height: 8;
@@ -109,6 +147,7 @@ class CoworkApp(App):
     #mentions-feed.empty { display: none; }
     #proj-tree-wrap { height: 1fr; }
     #members { width: 24; border-left: solid $primary 50%; }
+    #members-scroll { height: 1fr; }
     #main { height: 1fr; }
     #transcript { height: 1fr; border: none; padding: 0 1; }
     #autocomplete {
@@ -142,9 +181,14 @@ class CoworkApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
         Binding("ctrl+i", "focus_input", "Focus input", show=False),
-        Binding("ctrl+1", "focus_sidebar", "Sidebar", show=False),
-        Binding("ctrl+2", "focus_transcript", "Transcript", show=False),
-        Binding("ctrl+3", "focus_members", "Members", show=False),
+        # alt+<digit> (rather than ctrl+<digit>) because ASCII has no control
+        # code for digits — most terminals literally send "1"/"2"/"3" when
+        # the user presses ctrl+1/2/3, so the binding never fires. Alt is
+        # delivered as ESC+<key>, which terminals route reliably and Textual
+        # decodes as alt+1 / alt+2 / alt+3.
+        Binding("alt+1", "focus_sidebar", "Sidebar", show=False),
+        Binding("alt+2", "focus_transcript", "Transcript", show=False),
+        Binding("alt+3", "focus_members", "Members", show=False),
     ]
 
     def __init__(self) -> None:
@@ -158,11 +202,22 @@ class CoworkApp(App):
         self._server_url_hint = self.cache.get_state("last_server_url") or DEFAULT_SERVER_URL
         # Tracks whether full TUI mouse mode (drag tracking enabled) is active.
         self._mouse_capture_on: bool = False
-        # @-mention autocomplete state. _ac_anchor is the @-character index in
-        # the input buffer (None when no @ is being typed). _ac_options holds
-        # the member display names currently shown in the popup.
+        # Autocomplete state. _ac_anchor is the index of the trigger char
+        # (@ or /) in the input buffer; None when the popup is closed.
+        # _ac_mode picks the completion semantics on accept.
         self._ac_anchor: Optional[int] = None
         self._ac_options: list[str] = []
+        self._ac_mode: Optional[str] = None  # "mention" | "slash"
+        # Idle-watchdog plumbing. Overridable from tests via the class
+        # attributes so the suite can drive the transitions in ~1s instead
+        # of waiting two real minutes.
+        self._idle_threshold_s: float = IDLE_AWAY_THRESHOLD_S
+        self._idle_check_interval_s: float = IDLE_CHECK_INTERVAL_S
+        self._last_activity: float = time.time()
+        # Flips to True on the user's first /status — pins them to a manual
+        # presence and stops the watchdog from second-guessing them.
+        self._user_set_status: bool = False
+        self._idle_task: Optional[asyncio.Task] = None
 
     # ----- compose & mount -----
 
@@ -170,16 +225,23 @@ class CoworkApp(App):
         yield Header(show_clock=False)
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
+                yield Static("Channels  alt+1", classes="panel-label")
                 yield Static("", id="mentions-feed", classes="empty")
                 with VerticalScroll(id="proj-tree-wrap"):
                     yield Tree("Projects", id="proj-tree")
             with Vertical(id="main"):
+                yield Static("Transcript  alt+2", classes="panel-label")
                 yield RichLog(id="transcript", highlight=False, markup=True, wrap=True)
                 yield OptionList(id="autocomplete")
                 yield Static("", id="status")
-                yield Input(placeholder="Type a message or /help", id="input")
-            with VerticalScroll(id="members"):
-                yield Static("(no project)", id="members-list")
+                yield Input(
+                    placeholder="Type a message — / for command, @ to mention",
+                    id="input",
+                )
+            with Vertical(id="members"):
+                yield Static("Members  alt+3", classes="panel-label")
+                with VerticalScroll(id="members-scroll"):
+                    yield Static("(no project)", id="members-list")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -197,6 +259,11 @@ class CoworkApp(App):
         # press/release) and mode 1006 (SGR extended coords) are kept so
         # sidebar clicks and scroll-wheel still work via Textual.
         self._disable_drag_tracking()
+        # Idle watchdog: a single background task that flips presence to
+        # 'away' when keyboard activity stops and back to 'online' when it
+        # resumes (unless the user pinned their status manually).
+        self._last_activity = time.time()
+        self._idle_task = asyncio.create_task(self._idle_watchdog())
         cached = self.cache.list_projects()
         if not cached:
             self._write_system(
@@ -239,11 +306,61 @@ class CoworkApp(App):
             pass
 
     def action_focus_members(self) -> None:
-        """Focus the members panel container so it can scroll (ctrl+3)."""
+        """Focus the members panel scroll container (alt+3)."""
         try:
-            self.query_one("#members", VerticalScroll).focus()
+            self.query_one("#members-scroll", VerticalScroll).focus()
         except Exception:
             pass
+
+    # ----- presence / idle watchdog -----
+
+    def _my_status(self) -> str:
+        if not self.current_project_id:
+            return "online"
+        state = self.projects.get(self.current_project_id)
+        if not state:
+            return "online"
+        me = state.members.get(state.cached.member_id)
+        return (me or {}).get("status") or "online"
+
+    async def _send_status(self, status: str) -> None:
+        """Push a status change to the server for the current project. Used
+        by both /status and the idle watchdog; the server broadcasts the
+        change so we'll see our own status update arrive via the regular
+        member_status_changed frame."""
+        if not self.current_project_id:
+            return
+        state = self.projects.get(self.current_project_id)
+        if not state:
+            return
+        try:
+            await state.connection.send(
+                {"type": "update_status", "data": {"status": status}}
+            )
+        except Exception:
+            logger.exception("failed to push status=%s", status)
+
+    async def _idle_watchdog(self) -> None:
+        """Background loop that flips online ↔ away based on keyboard idle
+        time. Skips entirely while the user has pinned their status with
+        /status."""
+        try:
+            while True:
+                await asyncio.sleep(self._idle_check_interval_s)
+                if self._user_set_status:
+                    continue
+                if not self.current_project_id:
+                    continue
+                idle = time.time() - self._last_activity
+                cur = self._my_status()
+                if cur == "online" and idle >= self._idle_threshold_s:
+                    await self._send_status("away")
+                elif cur == "away" and idle < self._idle_threshold_s:
+                    await self._send_status("online")
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logger.exception("idle watchdog crashed")
 
     # ----- @ autocomplete -----
 
@@ -265,21 +382,69 @@ class CoworkApp(App):
             return None
         return i, value[i + 1 : cursor]
 
+    def _detect_slash(self, value: str, cursor: int) -> Optional[tuple[int, str]]:
+        """If the cursor sits inside the leading /<command> token, return
+        (0, partial). Slash commands are only valid at the start of the
+        buffer — typing '/' mid-message is just literal text."""
+        if not value.startswith("/"):
+            return None
+        end = 1
+        while end < len(value) and (value[end].isalnum() or value[end] in "-_"):
+            end += 1
+        if cursor > end:
+            return None
+        return 0, value[1:cursor]
+
     def _refresh_autocomplete(self) -> None:
-        """Recompute the autocomplete popup based on what the user has typed."""
+        """Recompute the autocomplete popup based on what the user has typed.
+        Tries the slash-command popup first (only valid at start-of-input),
+        then falls back to the @-mention popup."""
         try:
             inp = self.query_one("#input", Input)
             ac = self.query_one("#autocomplete", OptionList)
         except Exception:
             return
+        slash = self._detect_slash(inp.value, inp.cursor_position)
+        if slash is not None:
+            self._populate_slash(slash[1], ac)
+            return
+        mention = self._detect_mention(inp.value, inp.cursor_position)
+        if mention is not None:
+            self._populate_mention(mention[0], mention[1], ac)
+            return
+        self._hide_autocomplete()
+
+    def _populate_slash(self, partial: str, ac: OptionList) -> None:
+        partial_lower = partial.lower()
+        matches = [
+            (cmd, desc) for cmd, desc in SLASH_COMMANDS
+            if cmd.startswith(partial_lower)
+        ]
+        # If the user has already typed a full command name, there is
+        # nothing left to autocomplete — hide so Enter submits instead of
+        # re-inserting the same name with a trailing space.
+        if not matches or any(cmd == partial_lower for cmd, _ in matches):
+            self._hide_autocomplete()
+            return
+        self._ac_mode = "slash"
+        self._ac_anchor = 0
+        self._ac_options = [cmd for cmd, _ in matches]
+        ac.clear_options()
+        for cmd, desc in matches:
+            label = Text()
+            label.append(f"/{cmd}", style="bold cyan")
+            label.append(f"  {desc}", style="dim")
+            ac.add_option(Option(label, id=cmd))
+        ac.add_class("visible")
+        try:
+            ac.highlighted = 0
+        except Exception:
+            pass
+
+    def _populate_mention(self, anchor: int, partial: str, ac: OptionList) -> None:
         if not self.current_project_id:
             self._hide_autocomplete()
             return
-        match = self._detect_mention(inp.value, inp.cursor_position)
-        if match is None:
-            self._hide_autocomplete()
-            return
-        anchor, partial = match
         state = self.projects[self.current_project_id]
         my_id = state.cached.member_id
         partial_lower = partial.lower()
@@ -292,16 +457,19 @@ class CoworkApp(App):
         for special in ("here", "channel"):
             if not partial_lower or partial_lower in special:
                 matches.append(special)
-        if not matches:
+        # If the partial already spells out one of the offered names in
+        # full, hide — Enter should send the message rather than re-insert
+        # the same @name with a trailing space.
+        if not matches or any(name.lower() == partial_lower for name in matches):
             self._hide_autocomplete()
             return
+        self._ac_mode = "mention"
         self._ac_anchor = anchor
         self._ac_options = matches
         ac.clear_options()
         for name in matches:
             ac.add_option(Option(f"@{name}", id=name))
         ac.add_class("visible")
-        # Highlight the first option so Enter/Tab immediately accept it.
         try:
             ac.highlighted = 0
         except Exception:
@@ -310,6 +478,7 @@ class CoworkApp(App):
     def _hide_autocomplete(self) -> None:
         self._ac_anchor = None
         self._ac_options = []
+        self._ac_mode = None
         try:
             ac = self.query_one("#autocomplete", OptionList)
             ac.remove_class("visible")
@@ -318,8 +487,9 @@ class CoworkApp(App):
             pass
 
     def _accept_autocomplete(self) -> None:
-        """Replace the partial @<text> at the anchor with the highlighted
-        option, then hide the popup."""
+        """Replace the partial token at the anchor with the highlighted
+        option (prefixed with @ for mentions, / for commands), then hide
+        the popup."""
         if self._ac_anchor is None or not self._ac_options:
             return
         try:
@@ -334,7 +504,8 @@ class CoworkApp(App):
         name = self._ac_options[idx]
         anchor = self._ac_anchor
         cursor = inp.cursor_position
-        new_value = inp.value[:anchor] + f"@{name} " + inp.value[cursor:]
+        sigil = "/" if self._ac_mode == "slash" else "@"
+        new_value = inp.value[:anchor] + f"{sigil}{name} " + inp.value[cursor:]
         new_cursor = anchor + 1 + len(name) + 1
         self._hide_autocomplete()
         inp.value = new_value
@@ -356,8 +527,15 @@ class CoworkApp(App):
         self._refresh_autocomplete()
 
     async def on_key(self, event: events.Key) -> None:
-        """Intercept Up/Down/Tab/Enter/Escape when the @-autocomplete popup is
-        open, so the user can navigate it without losing focus on the input."""
+        """Track activity for the idle watchdog, and intercept
+        Up/Down/Tab/Enter/Escape when the autocomplete popup is open so the
+        user can navigate it without losing focus on the input."""
+        self._last_activity = time.time()
+        # Snap back to 'online' immediately on the next keystroke after
+        # auto-away, rather than waiting up to IDLE_CHECK_INTERVAL_S for the
+        # watchdog tick.
+        if not self._user_set_status and self._my_status() == "away":
+            asyncio.create_task(self._send_status("online"))
         if not self._autocomplete_visible():
             return
         if event.key == "down":
@@ -452,6 +630,13 @@ class CoworkApp(App):
             )
 
     async def on_unmount(self) -> None:
+        if self._idle_task is not None:
+            self._idle_task.cancel()
+            try:
+                await self._idle_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._idle_task = None
         for state in list(self.projects.values()):
             await state.connection.stop()
         self.cache.close()
@@ -1060,10 +1245,10 @@ class CoworkApp(App):
                 f" {', '.join(MEMBER_STATUSES)}[/red]"
             )
             return
-        state = self.projects[self.current_project_id]
-        await state.connection.send(
-            {"type": "update_status", "data": {"status": new_status}}
-        )
+        # Pin the user's status: the idle watchdog stops auto-managing
+        # presence as soon as the user has expressed a preference.
+        self._user_set_status = True
+        await self._send_status(new_status)
 
     async def _cmd_save_transcript(self, args: list[str]) -> None:
         """Write the current channel transcript to a file so users have a
