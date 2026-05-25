@@ -299,30 +299,39 @@ async def test_ctrl_c_writes_fallback_file_for_terminals_without_osc52(
     assert (tmp_path / "last-copy.txt").read_text() == "fallback me"
 
 
-async def test_app_and_richlog_allow_textual_selection() -> None:
-    """Cowork relies on Textual's built-in drag-select (introduced in 8.x).
-    This requires App.ALLOW_SELECT == True (the default), Screen.ALLOW_SELECT
-    == True (the default), and RichLog.allow_select == True (the default).
-    If any of those flips, drag-select stops working — fail loudly here."""
+async def test_ctrl_s_toggles_terminal_mouse_capture() -> None:
+    """By default Cowork starts in selection-friendly mode: drag tracking
+    (xterm modes 1002/1003) is disabled so native terminal text selection
+    works out of the box. ctrl+s toggles to full TUI mouse mode (drag
+    tracking on, orange status bar). Pressing it again restores the default."""
     app = CoworkApp()
-    async with app.run_test():
-        assert app.ALLOW_SELECT is True
-        assert app.screen.ALLOW_SELECT is True
-        log = app.query_one("#transcript", RichLog)
-        assert log.allow_select is True
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        # Default state: selection-friendly (drag tracking off).
+        assert app._mouse_capture_on is False
+        status = app.query_one("#status")
+        assert "tui-mouse-mode" not in status.classes
+
+        # First ctrl+s: enable full TUI mouse mode.
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app._mouse_capture_on is True
+        assert "tui-mouse-mode" in status.classes
+
+        # Second ctrl+s: back to selection-friendly mode.
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert app._mouse_capture_on is False
+        assert "tui-mouse-mode" not in status.classes
 
 
-async def test_screen_get_selected_text_is_available() -> None:
-    """ctrl+c calls screen.get_selected_text() to pull whatever the user
-    drag-selected. If Textual ever renames or removes this method, our copy
-    flow silently breaks — pin it down here."""
-    app = CoworkApp()
-    async with app.run_test():
-        assert hasattr(app.screen, "get_selected_text")
-        # With nothing selected the call must succeed and return an empty
-        # string / None — never raise.
-        result = app.screen.get_selected_text()
-        assert result in ("", None)
+async def test_real_textual_driver_exposes_mouse_escape_write() -> None:
+    """Compile-time check that the LinuxDriver still exposes write/flush so
+    our escape-sequence approach works on a real terminal."""
+    from textual.drivers.linux_driver import LinuxDriver
+
+    assert hasattr(LinuxDriver, "write")
+    assert hasattr(LinuxDriver, "flush")
 
 
 async def test_ctrl_c_with_no_selection_does_not_crash() -> None:
