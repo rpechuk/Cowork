@@ -347,26 +347,71 @@ async def test_alt_1_2_3_focus_each_panel() -> None:
         assert app.focused is not None and app.focused.id == "input"
 
 
-async def test_mac_option_key_chars_focus_panels() -> None:
+async def test_mac_option_key_chars_focus_panels_with_input_focused() -> None:
     """Default macOS Terminal.app / iTerm2 deliver Option+digit as a Unicode
     character (Option+1='¡', Option+2='™', Option+3='£'), not as ESC+digit.
-    Cowork binds those characters in addition to alt+1/2/3 so Mac users
-    don't have to enable 'Use Option as Meta key' to get panel focus."""
+    Cowork binds the Textual-normalized names of those characters as
+    priority bindings so they fire BEFORE the Input widget consumes them
+    as printable text — which is the failure mode users hit on real Macs.
+    After the keystroke, focus must have moved AND the Input value must
+    remain empty (the char didn't leak through)."""
     from textual.containers import VerticalScroll
     from textual.widgets import Tree
 
     app = CoworkApp()
     async with app.run_test() as pilot:
         await pilot.pause()
+        inp = app.query_one("#input", Input)
+        # Confirm starting state: Input has focus, value empty.
+        assert app.focused is inp
+        assert inp.value == ""
+
         await pilot.press("¡")
         await pilot.pause()
         assert isinstance(app.focused, Tree) and app.focused.id == "proj-tree"
+        assert inp.value == "", (
+            f"Option+1 ('¡') leaked into the input as {inp.value!r} — "
+            "the binding must run with priority so Input doesn't see it"
+        )
 
+        # Refocus input so the next press starts from the same situation.
+        inp.focus()
+        await pilot.pause()
         await pilot.press("™")
         await pilot.pause()
         assert isinstance(app.focused, RichLog) and app.focused.id == "transcript"
+        assert inp.value == ""
 
+        inp.focus()
+        await pilot.pause()
         await pilot.press("£")
+        await pilot.pause()
+        assert (
+            isinstance(app.focused, VerticalScroll)
+            and app.focused.id == "members-scroll"
+        )
+        assert inp.value == ""
+
+
+async def test_f_keys_focus_panels_as_universal_fallback() -> None:
+    """F2/F3/F4 always work — no Option/Alt/Meta dance, no keyboard layout
+    quirks. They're the escape hatch for any setup where the modifier-key
+    bindings don't fire."""
+    from textual.containers import VerticalScroll
+    from textual.widgets import Tree
+
+    app = CoworkApp()
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        await pilot.press("f2")
+        await pilot.pause()
+        assert isinstance(app.focused, Tree)
+
+        await pilot.press("f3")
+        await pilot.pause()
+        assert isinstance(app.focused, RichLog) and app.focused.id == "transcript"
+
+        await pilot.press("f4")
         await pilot.pause()
         assert (
             isinstance(app.focused, VerticalScroll)
@@ -474,9 +519,10 @@ async def test_panel_labels_show_shortcut_keys() -> None:
         await pilot.pause()
         labels = [s.render() for s in app.query(".panel-label")]
         text = " | ".join(str(r) for r in labels)
-        assert "alt+1" in text
-        assert "alt+2" in text
-        assert "alt+3" in text
+        # Every panel should advertise both the alt-style modifier shortcut
+        # AND a function-key fallback so the hint covers every setup.
+        for token in ("alt", "⌥1", "⌥2", "⌥3", "F2", "F3", "F4"):
+            assert token in text, f"missing {token!r} in panel labels: {text!r}"
 
 
 # ---------------------------------------------------------------------------

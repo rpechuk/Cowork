@@ -97,9 +97,10 @@ HELP_TEXT = """[b]Cowork commands[/b]
   mentions — Tab/Enter accepts, Esc dismisses.
 
 [b]Panel navigation[/b]
-  Each panel's header shows its shortcut. On Linux/Windows press [b]alt+1/2/3[/b];
-  on macOS press [b]Option+1/2/3[/b] (which sends ¡/™/£ — Cowork binds those too,
-  so it works without "Use Option as Meta key" enabled).
+  Each panel's header shows its shortcut. Three ways to jump:
+    • [b]alt+1 / alt+2 / alt+3[/b]   — Linux/Windows; macOS with "Use Option as Meta"
+    • [b]Option+1 / +2 / +3[/b]      — default macOS Terminal.app / iTerm2 (sends ¡/™/£)
+    • [b]F2 / F3 / F4[/b]            — works in every terminal, every layout
   [b]ctrl+i[/b] always snaps back to the input field.
   [b]↑/↓[/b] in the input cycle through your message history.
 
@@ -190,25 +191,51 @@ class CoworkApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
         Binding("ctrl+i", "focus_input", "Focus input", show=False),
-        # alt+<digit> (rather than ctrl+<digit>) because ASCII has no control
-        # code for digits — most terminals literally send "1"/"2"/"3" when
-        # the user presses ctrl+1/2/3, so the binding never fires. Alt is
-        # delivered as ESC+<key>, which terminals route reliably and Textual
-        # decodes as alt+1 / alt+2 / alt+3. The macOS Option key with the
-        # default terminal settings emits a Unicode char instead (¡/™/£);
-        # those are intercepted in on_key below.
-        Binding("alt+1", "focus_sidebar", "Sidebar", show=False),
-        Binding("alt+2", "focus_transcript", "Transcript", show=False),
-        Binding("alt+3", "focus_members", "Members", show=False),
+        # Panel focus shortcuts. Three keystrokes each for cross-platform
+        # reach:
+        #   - alt+<digit>: works on Linux/Windows, and on macOS terminals
+        #     that have "Use Option as Meta key" / "Esc+" mode enabled
+        #     (Textual decodes ESC+<digit> as alt+<digit>).
+        #   - The Textual-normalized name of the Unicode character that
+        #     default-config macOS Terminal.app and iTerm2 emit when the
+        #     user presses Option+digit on a US English keyboard:
+        #     Option+1='¡' → inverted_exclamation_mark,
+        #     Option+2='™' → trade_mark_sign,
+        #     Option+3='£' → pound_sign. Binding the *named* form (rather
+        #     than the literal char) is what Textual matches against
+        #     event.key.
+        #   - F2/F3/F4: terminal-universal fallback that doesn't depend on
+        #     keyboard layout or Option-key configuration at all.
+        # priority=True ensures these fire BEFORE the focused Input
+        # consumes the keystroke as a printable char — otherwise typing
+        # ¡/™/£ would land in the input box instead of jumping panels.
+        Binding(
+            "alt+1,inverted_exclamation_mark,f2",
+            "focus_sidebar",
+            "Sidebar",
+            priority=True,
+            show=False,
+        ),
+        Binding(
+            "alt+2,trade_mark_sign,f3",
+            "focus_transcript",
+            "Transcript",
+            priority=True,
+            show=False,
+        ),
+        Binding(
+            "alt+3,pound_sign,f4",
+            "focus_members",
+            "Members",
+            priority=True,
+            show=False,
+        ),
     ]
 
-    # On default macOS terminal settings, Option+digit produces a literal
-    # Unicode character rather than ESC+digit. Textual exposes those chars
-    # as descriptive key names (inverted_exclamation_mark, trade_mark_sign,
-    # pound_sign), and binding them via the BINDINGS table doesn't fire
-    # consistently with the Input widget focused — so we intercept them in
-    # on_key. Both the literal character and the Textual-normalized name
-    # are matched, defensively.
+    # Backstop for any path where the priority Binding above doesn't fire
+    # (e.g. terminals that emit the literal Unicode character with no
+    # normalization, exotic Textual versions). Both the named form and the
+    # literal char are matched.
     MAC_OPTION_KEYS: dict[str, str] = {
         "¡": "action_focus_sidebar",
         "inverted_exclamation_mark": "action_focus_sidebar",
@@ -259,12 +286,12 @@ class CoworkApp(App):
         yield Header(show_clock=False)
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Static("Channels  alt+1 / ⌥1", classes="panel-label")
+                yield Static("Channels  alt/⌥1 · F2", classes="panel-label")
                 yield Static("", id="mentions-feed", classes="empty")
                 with VerticalScroll(id="proj-tree-wrap"):
                     yield Tree("Projects", id="proj-tree")
             with Vertical(id="main"):
-                yield Static("Transcript  alt+2 / ⌥2", classes="panel-label")
+                yield Static("Transcript  alt/⌥2 · F3", classes="panel-label")
                 yield RichLog(id="transcript", highlight=False, markup=True, wrap=True)
                 yield OptionList(id="autocomplete")
                 yield Static("", id="status")
@@ -273,7 +300,7 @@ class CoworkApp(App):
                     id="input",
                 )
             with Vertical(id="members"):
-                yield Static("Members  alt+3 / ⌥3", classes="panel-label")
+                yield Static("Members  alt/⌥3 · F4", classes="panel-label")
                 with VerticalScroll(id="members-scroll"):
                     yield Static("(no project)", id="members-list")
         yield Footer()
