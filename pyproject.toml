@@ -15,6 +15,15 @@ dependencies = [
     "platformdirs>=4.2",
 ]
 
+[project.optional-dependencies]
+# Test dependencies, installable via `pip install -e ".[test]"`. CI uses
+# this extras group; local devs can use it too instead of remembering
+# the exact list.
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
 [project.scripts]
 cowork = "cowork.cli:main"
 

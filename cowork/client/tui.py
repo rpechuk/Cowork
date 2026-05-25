@@ -96,13 +96,9 @@ HELP_TEXT = """[b]Cowork commands[/b]
   an autocomplete menu appears for both [b]/[/b] commands and [b]@[/b]
   mentions — Tab/Enter accepts, Esc dismisses.
 
-[b]Panel navigation[/b]
-  Each panel's header shows its shortcut. Three ways to jump:
-    • [b]alt+1 / alt+2 / alt+3[/b]   — Linux/Windows; macOS with "Use Option as Meta"
-    • [b]Option+1 / +2 / +3[/b]      — default macOS Terminal.app / iTerm2 (sends ¡/™/£)
-    • [b]F2 / F3 / F4[/b]            — works in every terminal, every layout
-  [b]ctrl+i[/b] always snaps back to the input field.
-  [b]↑/↓[/b] in the input cycle through your message history.
+[b]Input shortcuts[/b]
+  [b]ctrl+i[/b] snaps focus back to the input field.
+  [b]↑/↓[/b] cycle through your previously-submitted messages and commands.
 
 [b]Selecting and copying text[/b]
   Drag in the transcript to select. Mouse drag-tracking is off by default,
@@ -140,13 +136,6 @@ class CoworkApp(App):
     Screen { layout: vertical; }
     #body { height: 1fr; }
     #sidebar { width: 28; border-right: solid $primary 50%; }
-    .panel-label {
-        height: 1;
-        padding: 0 1;
-        background: $primary 20%;
-        color: $text-muted;
-        text-style: bold;
-    }
     #mentions-feed {
         height: auto;
         max-height: 8;
@@ -157,7 +146,6 @@ class CoworkApp(App):
     #mentions-feed.empty { display: none; }
     #proj-tree-wrap { height: 1fr; }
     #members { width: 24; border-left: solid $primary 50%; }
-    #members-scroll { height: 1fr; }
     #main { height: 1fr; }
     #transcript { height: 1fr; border: none; padding: 0 1; }
     #autocomplete {
@@ -191,59 +179,7 @@ class CoworkApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("ctrl+l", "show_help", "Help"),
         Binding("ctrl+i", "focus_input", "Focus input", show=False),
-        # Panel focus shortcuts. Three keystrokes each for cross-platform
-        # reach:
-        #   - alt+<digit>: works on Linux/Windows, and on macOS terminals
-        #     that have "Use Option as Meta key" / "Esc+" mode enabled
-        #     (Textual decodes ESC+<digit> as alt+<digit>).
-        #   - The Textual-normalized name of the Unicode character that
-        #     default-config macOS Terminal.app and iTerm2 emit when the
-        #     user presses Option+digit on a US English keyboard:
-        #     Option+1='¡' → inverted_exclamation_mark,
-        #     Option+2='™' → trade_mark_sign,
-        #     Option+3='£' → pound_sign. Binding the *named* form (rather
-        #     than the literal char) is what Textual matches against
-        #     event.key.
-        #   - F2/F3/F4: terminal-universal fallback that doesn't depend on
-        #     keyboard layout or Option-key configuration at all.
-        # priority=True ensures these fire BEFORE the focused Input
-        # consumes the keystroke as a printable char — otherwise typing
-        # ¡/™/£ would land in the input box instead of jumping panels.
-        Binding(
-            "alt+1,inverted_exclamation_mark,f2",
-            "focus_sidebar",
-            "Sidebar",
-            priority=True,
-            show=False,
-        ),
-        Binding(
-            "alt+2,trade_mark_sign,f3",
-            "focus_transcript",
-            "Transcript",
-            priority=True,
-            show=False,
-        ),
-        Binding(
-            "alt+3,pound_sign,f4",
-            "focus_members",
-            "Members",
-            priority=True,
-            show=False,
-        ),
     ]
-
-    # Backstop for any path where the priority Binding above doesn't fire
-    # (e.g. terminals that emit the literal Unicode character with no
-    # normalization, exotic Textual versions). Both the named form and the
-    # literal char are matched.
-    MAC_OPTION_KEYS: dict[str, str] = {
-        "¡": "action_focus_sidebar",
-        "inverted_exclamation_mark": "action_focus_sidebar",
-        "™": "action_focus_transcript",
-        "trade_mark_sign": "action_focus_transcript",
-        "£": "action_focus_members",
-        "pound_sign": "action_focus_members",
-    }
 
     def __init__(self) -> None:
         super().__init__()
@@ -286,12 +222,10 @@ class CoworkApp(App):
         yield Header(show_clock=False)
         with Horizontal(id="body"):
             with Vertical(id="sidebar"):
-                yield Static("Channels  alt/⌥1 · F2", classes="panel-label")
                 yield Static("", id="mentions-feed", classes="empty")
                 with VerticalScroll(id="proj-tree-wrap"):
                     yield Tree("Projects", id="proj-tree")
             with Vertical(id="main"):
-                yield Static("Transcript  alt/⌥2 · F3", classes="panel-label")
                 yield RichLog(id="transcript", highlight=False, markup=True, wrap=True)
                 yield OptionList(id="autocomplete")
                 yield Static("", id="status")
@@ -299,10 +233,8 @@ class CoworkApp(App):
                     placeholder="Type a message — / for command, @ to mention, ↑/↓ for history",
                     id="input",
                 )
-            with Vertical(id="members"):
-                yield Static("Members  alt/⌥3 · F4", classes="panel-label")
-                with VerticalScroll(id="members-scroll"):
-                    yield Static("(no project)", id="members-list")
+            with VerticalScroll(id="members"):
+                yield Static("(no project)", id="members-list")
         yield Footer()
 
     async def on_mount(self) -> None:
@@ -349,27 +281,6 @@ class CoworkApp(App):
         """Snap focus back to the input field (ctrl+i)."""
         try:
             self.query_one("#input", Input).focus()
-        except Exception:
-            pass
-
-    def action_focus_sidebar(self) -> None:
-        """Focus the projects/channels tree (ctrl+1)."""
-        try:
-            self.query_one("#proj-tree", Tree).focus()
-        except Exception:
-            pass
-
-    def action_focus_transcript(self) -> None:
-        """Focus the transcript so PageUp/PageDown scroll it (ctrl+2)."""
-        try:
-            self.query_one("#transcript", RichLog).focus()
-        except Exception:
-            pass
-
-    def action_focus_members(self) -> None:
-        """Focus the members panel scroll container (alt+3)."""
-        try:
-            self.query_one("#members-scroll", VerticalScroll).focus()
         except Exception:
             pass
 
@@ -640,16 +551,6 @@ class CoworkApp(App):
         # watchdog tick.
         if not self._user_set_status and self._my_status() == "away":
             asyncio.create_task(self._send_status("online"))
-        # Mac Option+digit fallback for default-config terminals (see the
-        # MAC_OPTION_KEYS table above).
-        action_name = self.MAC_OPTION_KEYS.get(event.key)
-        if action_name is not None:
-            handler = getattr(self, action_name, None)
-            if handler is not None:
-                handler()
-                event.prevent_default()
-                event.stop()
-                return
         if self._autocomplete_visible():
             if event.key == "down":
                 self._autocomplete_move(1)
@@ -668,9 +569,7 @@ class CoworkApp(App):
                 event.prevent_default()
                 event.stop()
             return
-        # No popup open — let ↑/↓ walk the input history (only when the
-        # input itself is focused; otherwise the keys belong to whichever
-        # widget is focused, e.g. tree navigation or transcript scroll).
+        # No popup open — let ↑/↓ walk the input history.
         if self.focused is not None and self.focused.id == "input":
             if event.key == "up":
                 if self._history_back():
