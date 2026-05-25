@@ -16,6 +16,21 @@ class Member(BaseModel):
     project_id: str
     display_name: str
     joined_at: float
+    is_agent: bool = False
+
+
+TriggerMode = Literal["always", "on_mention", "on_question"]
+
+
+class Agent(BaseModel):
+    member_id: str
+    display_name: str
+    owner_member_id: str
+    channel_id: Optional[str] = None
+    system_prompt: str = ""
+    trigger_mode: TriggerMode = "on_mention"
+    model: Optional[str] = None
+    created_at: float
 
 
 class Channel(BaseModel):
@@ -83,7 +98,20 @@ class BootstrapResponse(BaseModel):
     member_id: str
     channels: list[Channel]
     members: list[Member]
+    agents: list[Agent] = Field(default_factory=list)
     unread: dict[str, UnreadState] = Field(default_factory=dict)
+
+
+class CreateAgentRequest(BaseModel):
+    display_name: str
+    system_prompt: str = ""
+    trigger_mode: TriggerMode = "on_mention"
+    model: Optional[str] = None
+    channel_id: Optional[str] = None
+
+
+class CreateAgentResponse(BaseModel):
+    agent: Agent
 
 
 # ---- WebSocket frame envelopes ----

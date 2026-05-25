@@ -74,6 +74,46 @@ async def http_bootstrap(server_url: str, member_token: str, project_id: str) ->
     return r.json()
 
 
+async def http_create_agent(
+    server_url: str,
+    member_token: str,
+    project_id: str,
+    *,
+    display_name: str,
+    system_prompt: str = "",
+    trigger_mode: str = "on_mention",
+    model: Optional[str] = None,
+    channel_id: Optional[str] = None,
+) -> dict:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.post(
+            f"{http_base(server_url)}/projects/{project_id}/agents",
+            json={
+                "display_name": display_name,
+                "system_prompt": system_prompt,
+                "trigger_mode": trigger_mode,
+                "model": model,
+                "channel_id": channel_id,
+            },
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+    if r.status_code >= 400:
+        raise ServerError(r.text)
+    return r.json()
+
+
+async def http_delete_agent(
+    server_url: str, member_token: str, project_id: str, agent_id: str
+) -> None:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.delete(
+            f"{http_base(server_url)}/projects/{project_id}/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+    if r.status_code >= 400:
+        raise ServerError(r.text)
+
+
 class ProjectConnection:
     """One WebSocket connection per joined project. Reconnects with backoff."""
 

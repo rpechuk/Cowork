@@ -2,13 +2,13 @@
 
 Multi-human, multi-agent collaborative chat — a TUI wrapper around the Claude
 Agent SDK where conversations live under a shared **project**, organized into
-**channels**, and (eventually) branch like a git DAG. This repo currently ships
-the foundation: phases 0–2 of the [build plan](docs/protocol.md).
+**channels**, and (eventually) branch like a git DAG.
 
-> **Status:** phases 0–2 complete.
-> Server, HTTP + WS protocol, Textual TUI, project/invite flow, channels, and
-> cross-channel @mention notifications with terminal bell. No agents yet —
-> those land in phase 3+.
+> **Status:** phases 0–4 complete.
+> Server, HTTP + WS protocol, Textual TUI, project/invite flow, channels,
+> cross-channel @mention notifications with terminal bell, and Claude-powered
+> agents (single and multi-agent, configurable per-agent trigger mode, with a
+> per-channel loop guard to stop runaway agent-to-agent chains).
 
 ## Quick start
 
@@ -52,6 +52,10 @@ reconnect to every cached project automatically — no re-login.
 | `/channel new <name>` | Create a channel in the current project |
 | `/channel <name>` | Switch to a channel |
 | `/invite` | Mint a fresh invite (prints a `cowork://` URL) |
+| `/api-key <sk-ant-...>` | Register your Anthropic key for the current project |
+| `/agent add <name> <trigger> ["system prompt"]` | Spawn an agent in the current channel |
+| `/agent list` | Show every agent in this project |
+| `/agent remove <name>` | Delete an agent |
 | `/save-transcript [path]` | Write the current channel to a file (easy copy) |
 | `/leave-project` | Remove the current project from this device only |
 | `/quit` (or `ctrl+q`) | Exit |
@@ -86,16 +90,50 @@ than a single selection.
 
 Quitting: **`ctrl+q`** (or `/quit`).
 
+## Agents
+
+Cowork agents are first-class chat participants powered by the
+[`claude-agent-sdk`](https://pypi.org/project/claude-agent-sdk/). Each agent
+is a member of the project (with `is_agent` set), so it shows up in member
+lists, gets its own `@display_name`, and you `@mention` it like you would a
+human.
+
+```bash
+# Inside the TUI, after creating or joining a project:
+/api-key sk-ant-...                           # register your Anthropic key
+/agent add researcher on_mention "You are a careful researcher who cites sources."
+/agent add critic    always       "Critique every claim in the chat for accuracy."
+/agent list                                    # see who's in the project
+@researcher what's the best way to ...?       # trigger the on_mention agent
+```
+
+Per-agent **trigger modes**:
+
+- `always` — respond to every message (except the agent's own).
+- `on_mention` — respond when `@name` appears in a message (case-insensitive).
+- `on_question` — respond when the message ends in `?`.
+
+**API key handling**: keys never touch disk on the server. Your TUI caches
+its key locally and forwards it via the WebSocket on every reconnect; the
+server keeps it in memory only while your session is live. When the agent's
+owner disconnects, the agent goes dormant until that owner reconnects with a
+key.
+
+**Loop guard**: agent-to-agent chains stop after 4 consecutive agent
+messages without a human in between. A human message in the same channel
+resets the streak.
+
+**Workspaces**: every channel gets its own scratch directory under
+`$COWORK_HOME/workspaces/<channel_id>/` that's passed to the agent's
+`claude-agent-sdk` invocation as `cwd`, so agents can use full Claude Code
+tools (file edit, bash, web fetch) against a shared per-channel workspace.
+
 ## Protocol
 
 See [`docs/protocol.md`](docs/protocol.md) for the HTTP + WebSocket spec.
 
 ## Roadmap
 
-- **Phase 3** — Single agent per channel via the Claude Agent SDK, per-agent
-  trigger mode (`always` / `on_mention` / `on_question`).
-- **Phase 4** — Multi-agent rooms with agent-to-agent communication and a
-  loop guard.
 - **Phase 5** — Ceremony engine: auto-closing polls, approval gates,
   claimable tasks.
 - **Phase 6** — More ceremonies: proposals, check-ins, brainstorm.
