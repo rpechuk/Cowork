@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import shlex
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -59,6 +61,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("invite", "mint a fresh invite token"),
     ("status", "set presence (online/away/busy/offline)"),
     ("agent", "add / list / remove project agents"),
+    ("login", "authenticate the local Claude CLI (claude login)"),
     ("save-transcript", "write the current channel to a file"),
     ("leave-project", "remove the current project from this device"),
     ("quit", "exit"),
@@ -106,6 +109,11 @@ HELP_TEXT = """[b]Cowork commands[/b]
                                           in any channel
   /agent list                          — show registered agents
   /agent remove <name>                 — tear down an agent
+  /login                               — run `claude login` so agents on a
+                                          server running on this same
+                                          machine can authenticate (browser
+                                          OAuth flow; the TUI suspends
+                                          itself while it runs)
   /save-transcript [path]              — write the current channel to a file
   /leave-project                       — remove the current project from this device
   /quit                                — exit
@@ -1213,6 +1221,8 @@ class CoworkApp(App):
             await self._cmd_status(args)
         elif cmd == "agent":
             await self._cmd_agent(args)
+        elif cmd == "login":
+            await self._cmd_login(args)
         else:
             self._write_system(f"[red]unknown command: /{cmd}[/red] — try /help")
 
@@ -1378,6 +1388,77 @@ class CoworkApp(App):
         # presence as soon as the user has expressed a preference.
         self._user_set_status = True
         await self._send_status(new_status)
+
+    # The Anthropic CLI used by claude_agent_sdk. Stored as a class
+    # attribute so tests can override it without monkey-patching shutil.
+    CLAUDE_CLI_BIN = "claude"
+    CLAUDE_INSTALL_HINT = (
+        "Install the Claude CLI first:\n"
+        "  [b]npm install -g @anthropic-ai/claude-code[/b]\n"
+        "Then re-run [b]/login[/b]."
+    )
+
+    async def _cmd_login(self, args: list[str]) -> None:
+        """Authenticate the local Claude CLI by shelling out to
+        `claude login`. The TUI suspends itself for the duration so the
+        CLI can take over the terminal for its browser-flow prompts.
+
+        This authenticates *the local machine's* SDK — useful when you're
+        running `cowork serve` on the same box as your TUI. For a remote
+        server, the OAuth has to happen on the server box (or each user
+        will eventually plug in their own key — see the "token economy"
+        roadmap).
+        """
+        if shutil.which(self.CLAUDE_CLI_BIN) is None:
+            self._write_system(
+                f"[red]'{self.CLAUDE_CLI_BIN}' not found on PATH.[/red]\n"
+                + self.CLAUDE_INSTALL_HINT
+            )
+            return
+        self._write_system(
+            "[dim]Pausing TUI to run [b]claude login[/b]…"
+            " your terminal will be handed over for the browser flow."
+            "[/dim]"
+        )
+        try:
+            returncode = await self._run_claude_login()
+        except FileNotFoundError:
+            # Race: the binary disappeared between the which() check and
+            # the subprocess call. Treat the same as missing.
+            self._write_system(
+                f"[red]'{self.CLAUDE_CLI_BIN}' vanished from PATH.[/red]\n"
+                + self.CLAUDE_INSTALL_HINT
+            )
+            return
+        except Exception as e:
+            self._write_system(
+                f"[red]failed to launch claude login: {e}[/red]"
+            )
+            return
+        if returncode == 0:
+            self._write_system(
+                "[green]✓ Authenticated.[/green] Agents on a server"
+                " running on this same machine can now respond."
+            )
+        else:
+            self._write_system(
+                f"[red]claude login exited with status {returncode}.[/red]"
+                " Run it directly in a separate terminal if the in-TUI"
+                " flow keeps failing."
+            )
+
+    async def _run_claude_login(self) -> int:
+        """Suspend the TUI, run `claude login` synchronously with the
+        terminal handed over, and return its exit code. Factored out so
+        tests can replace it with a fake that records the call without
+        actually launching the CLI."""
+        # App.suspend() restores the terminal to cooked mode and yields
+        # the screen to whatever subprocess we spawn inside the `with`
+        # block. After the subprocess exits, Textual reclaims the screen
+        # and re-renders.
+        with self.suspend():
+            proc = subprocess.run([self.CLAUDE_CLI_BIN, "login"])
+        return proc.returncode
 
     async def _cmd_agent(self, args: list[str]) -> None:
         """Sub-command dispatch for /agent.
