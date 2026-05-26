@@ -55,29 +55,49 @@ async def http_register_agent(
     server_url: str,
     member_token: str,
     project_id: str,
-    display_name: str,
-    system_prompt: str,
-    model: str = "claude-sonnet-4-6",
-    history_messages: int = 20,
+    *,
+    display_name: str | None = None,
+    system_prompt: str | None = None,
+    model: str | None = None,
+    history_messages: int | None = None,
+    preset: str | None = None,
 ) -> dict:
-    """POST a new agent membership. The server returns the agent's
-    member_id; the agent will also appear in everyone's members panel via
-    the broadcast `member_joined` frame, so the TUI doesn't have to plumb
-    the response through any extra state."""
+    """POST a new agent membership. Either pass `system_prompt` directly
+    or pass a `preset` name (or both — explicit fields win). The server
+    returns the agent's member_id; the agent will also appear in
+    everyone's members panel via the broadcast `member_joined` frame, so
+    the TUI doesn't have to plumb the response through any extra state."""
+    payload: dict = {}
+    if display_name is not None:
+        payload["display_name"] = display_name
+    if system_prompt is not None:
+        payload["system_prompt"] = system_prompt
+    if model is not None:
+        payload["model"] = model
+    if history_messages is not None:
+        payload["history_messages"] = history_messages
+    if preset is not None:
+        payload["preset"] = preset
     async with httpx.AsyncClient(timeout=15.0) as client:
         r = await client.post(
             f"{http_base(server_url)}/projects/{project_id}/agents",
             headers={"Authorization": f"Bearer {member_token}"},
-            json={
-                "display_name": display_name,
-                "system_prompt": system_prompt,
-                "model": model,
-                "history_messages": history_messages,
-            },
+            json=payload,
         )
     if r.status_code >= 400:
         raise ServerError(r.text)
     return r.json()
+
+
+async def http_list_agent_presets(server_url: str) -> list[dict]:
+    """Fetch the curated preset library. No auth needed — preset
+    definitions aren't private and the TUI uses them to populate the
+    `/agent presets` listing."""
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.get(f"{http_base(server_url)}/agents/presets")
+    if r.status_code >= 400:
+        raise ServerError(r.text)
+    return r.json().get("presets", [])
 
 
 async def http_remove_agent(

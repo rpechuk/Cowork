@@ -103,16 +103,39 @@ class MintInviteResponse(BaseModel):
 
 
 class RegisterAgentRequest(BaseModel):
-    display_name: str
-    system_prompt: str
-    model: str = "claude-sonnet-4-6"
-    history_messages: int = 20
+    """Request shape for `POST /projects/{id}/agents`.
+
+    Two modes, distinguished by which fields are set:
+      - Custom agent: `display_name` + `system_prompt` (+ optional `model`).
+      - Preset agent: `preset` + optional `display_name` override. The
+        server looks up the preset's system_prompt + model and uses them.
+        `display_name` defaults to the preset's name when omitted.
+
+    Mixing modes (e.g. `preset` + explicit `system_prompt`) is allowed —
+    the explicit fields win.
+    """
+
+    display_name: Optional[str] = None
+    system_prompt: Optional[str] = None
+    model: Optional[str] = None
+    history_messages: Optional[int] = None
+    preset: Optional[str] = None
 
 
 class RegisterAgentResponse(BaseModel):
     member_id: str
     display_name: str
     kind: MemberKind = "agent"
+
+
+class AgentPreset(BaseModel):
+    name: str
+    description: str
+    model: str
+
+
+class ListPresetsResponse(BaseModel):
+    presets: list[AgentPreset]
 
 
 class BootstrapResponse(BaseModel):

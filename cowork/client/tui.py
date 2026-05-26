@@ -23,6 +23,7 @@ from cowork.client.conn import (
     ServerError,
     http_bootstrap,
     http_create_project,
+    http_list_agent_presets,
     http_mint_invite,
     http_redeem_invite,
     http_register_agent,
@@ -91,10 +92,18 @@ HELP_TEXT = """[b]Cowork commands[/b]
                                           Cowork flips you to 'away' after a
                                           couple minutes idle and back on
                                           activity)
-  /agent add <name> <system prompt…>   — register a Claude-Agent-SDK-backed
-                                          agent in the current project; it
-                                          responds whenever someone @-mentions
-                                          it in any channel
+  /agent presets                       — list curated agent presets
+                                          (architect, reviewer, tester,
+                                          debugger, skeptic …)
+  /agent add preset:<name> [as_name]   — register one of the presets above;
+                                          shorthand for /agent add with the
+                                          preset's prompt + model baked in
+                                          (use as_name to override the
+                                          default display name)
+  /agent add <name> <system prompt…>   — register a custom agent in the
+                                          current project; it responds
+                                          whenever someone @-mentions it
+                                          in any channel
   /agent list                          — show registered agents
   /agent remove <name>                 — tear down an agent
   /save-transcript [path]              — write the current channel to a file
@@ -1392,26 +1401,67 @@ class CoworkApp(App):
             await self._cmd_agent_list()
         elif sub in ("remove", "rm"):
             await self._cmd_agent_remove(rest)
+        elif sub == "presets":
+            await self._cmd_agent_presets()
         else:
             self._write_system(
-                f"[red]unknown agent subcommand: {sub!r}[/red] — try add/list/remove"
+                f"[red]unknown agent subcommand: {sub!r}[/red] — try"
+                " add/list/remove/presets"
             )
 
     async def _cmd_agent_add(self, rest: list[str]) -> None:
-        """`/agent add <name> <system prompt…>` — the prompt slurps every
-        remaining token (shlex already merged quoted strings), so users can
-        either quote the prompt or just type it after the name."""
+        """`/agent add` accepts two forms:
+
+        - Custom: `/agent add <name> <system prompt…>`
+        - Preset: `/agent add preset:<preset_name> [override_name]` —
+          server fills in the system prompt + model from the curated
+          library; display name defaults to the preset name.
+        """
+        if not rest:
+            self._write_system(
+                "[red]usage: /agent add <name> <system prompt…>[/red]\n"
+                "[red]   or: /agent add preset:<preset_name> [override_name][/red]"
+            )
+            return
+
+        state = self.projects[self.current_project_id]
+        first = rest[0]
+        if first.startswith("preset:"):
+            preset_name = first.split(":", 1)[1].strip()
+            if not preset_name:
+                self._write_system("[red]preset name cannot be empty[/red]")
+                return
+            override_display = rest[1] if len(rest) > 1 else None
+            try:
+                resp = await http_register_agent(
+                    state.cached.server_url,
+                    state.cached.member_token,
+                    state.cached.project_id,
+                    preset=preset_name,
+                    display_name=override_display,
+                )
+            except ServerError as e:
+                self._write_system(
+                    f"[red]failed to register agent: {e}[/red]"
+                )
+                return
+            self._write_system(
+                f"[dim]→ agent @{resp['display_name']} registered"
+                f" (preset: {preset_name})[/dim]"
+            )
+            return
+
+        # Custom mode: first token is the display name, the rest is the prompt.
         if len(rest) < 2:
             self._write_system(
                 "[red]usage: /agent add <name> <system prompt…>[/red]"
             )
             return
-        display_name = rest[0]
+        display_name = first
         system_prompt = " ".join(rest[1:]).strip()
         if not system_prompt:
             self._write_system("[red]system prompt cannot be empty[/red]")
             return
-        state = self.projects[self.current_project_id]
         try:
             await http_register_agent(
                 state.cached.server_url,
@@ -1429,6 +1479,27 @@ class CoworkApp(App):
         self._write_system(
             f"[dim]→ agent @{display_name} registered[/dim]"
         )
+
+    async def _cmd_agent_presets(self) -> None:
+        """`/agent presets` — dump the curated preset library so users can
+        see what's available before running `/agent add preset:<name>`."""
+        state = self.projects[self.current_project_id]
+        try:
+            presets = await http_list_agent_presets(state.cached.server_url)
+        except ServerError as e:
+            self._write_system(
+                f"[red]failed to fetch presets: {e}[/red]"
+            )
+            return
+        if not presets:
+            self._write_system(
+                "[dim]no agent presets registered on this server[/dim]"
+            )
+            return
+        lines = ["[b]Agent presets[/b] — use [b]/agent add preset:<name>[/b]"]
+        for p in presets:
+            lines.append(f"  🤖 [b]{p['name']}[/b]  — {p['description']}")
+        self._write_system("\n".join(lines))
 
     async def _cmd_agent_list(self) -> None:
         state = self.projects[self.current_project_id]
