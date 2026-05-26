@@ -17,13 +17,16 @@ from fastapi import (
 )
 
 from cowork.paths import server_db_path
+from cowork.server.agent_presets import PRESETS, list_presets
 from cowork.server.agent_runner import AgentRunner, ClaudeSDKAgentRunner
 from cowork.server.db import Database
 from cowork.shared.protocol import (
     AgentConfig,
+    AgentPreset,
     BootstrapResponse,
     CreateProjectRequest,
     CreateProjectResponse,
+    ListPresetsResponse,
     Member,
     MintInviteRequest,
     MintInviteResponse,
@@ -219,6 +222,15 @@ async def bootstrap(
     )
 
 
+@app.get("/agents/presets", response_model=ListPresetsResponse)
+async def get_agent_presets():
+    """List the built-in agent presets. Open endpoint — preset definitions
+    aren't private and clients use this to render their menus."""
+    return ListPresetsResponse(
+        presets=[AgentPreset(**p) for p in list_presets()]
+    )
+
+
 @app.post(
     "/projects/{project_id}/agents", response_model=RegisterAgentResponse
 )
@@ -230,19 +242,64 @@ async def register_agent(
     manager: ConnectionManager = Depends(conn_manager_dep),
 ):
     """Add an agent member to the project. Any existing member of the
-    project can register an agent. The agent shows up in everyone's
-    members panel and starts responding the moment somebody @-mentions
-    them in a channel."""
-    member_id, member_project = member
+    project can register an agent. Two modes:
+
+    - Custom: caller supplies `display_name` and `system_prompt` directly.
+    - Preset: caller supplies `preset` (a key into PRESETS); the server
+      fills in system_prompt + model from the registry. `display_name`
+      defaults to the preset name when omitted, so the simplest
+      registration is `{"preset": "architect"}`.
+
+    Mixing modes is allowed — any explicit field overrides the preset
+    default."""
+    _, member_project = member
     if member_project != project_id:
         raise HTTPException(status_code=403, detail="not a member of this project")
+
+    preset_prompt: str | None = None
+    preset_model: str | None = None
+    preset_history: int | None = None
+    display_name = (req.display_name or "").strip() or None
+    if req.preset:
+        try:
+            _, preset_cfg = PRESETS[req.preset]
+        except KeyError:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"unknown preset {req.preset!r}; available: "
+                    f"{', '.join(sorted(PRESETS))}"
+                ),
+            )
+        preset_prompt = preset_cfg.system_prompt
+        preset_model = preset_cfg.model
+        preset_history = preset_cfg.history_messages
+        if display_name is None:
+            display_name = req.preset
+
+    system_prompt = (req.system_prompt or preset_prompt or "").strip()
+    if not system_prompt:
+        raise HTTPException(
+            status_code=400,
+            detail="system_prompt is required (or pass a `preset`)",
+        )
+    if not display_name:
+        raise HTTPException(
+            status_code=400, detail="display_name is required",
+        )
+
     config = AgentConfig(
-        system_prompt=req.system_prompt,
-        model=req.model,
-        history_messages=req.history_messages,
+        system_prompt=system_prompt,
+        model=req.model or preset_model or AgentConfig.model_fields["model"].default,
+        history_messages=(
+            req.history_messages
+            if req.history_messages is not None
+            else (preset_history if preset_history is not None
+                  else AgentConfig.model_fields["history_messages"].default)
+        ),
     )
     try:
-        agent = await db.create_agent(project_id, req.display_name.strip(), config)
+        agent = await db.create_agent(project_id, display_name, config)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     # Fan out so every connected client sees the new agent show up in
