@@ -108,8 +108,9 @@ async def test_login_command_surfaces_nonzero_exit(
 async def test_login_appears_in_slash_autocomplete() -> None:
     """The autocomplete menu and HELP_TEXT both need to know about /login
     — otherwise users won't discover it."""
-    from cowork.client.tui import HELP_TEXT, SLASH_COMMANDS
+    from cowork.client.tui import COMMAND_REGISTRY, HELP_TEXT, slash_commands
 
-    names = {name for name, _ in SLASH_COMMANDS}
+    assert "login" in COMMAND_REGISTRY
+    names = {name for name, _ in slash_commands()}
     assert "login" in names
     assert "/login" in HELP_TEXT
