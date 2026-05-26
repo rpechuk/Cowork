@@ -25,6 +25,8 @@ from cowork.client.conn import (
     http_create_project,
     http_mint_invite,
     http_redeem_invite,
+    http_register_agent,
+    http_remove_agent,
 )
 from cowork.client.invite import format_invite, parse_invite
 from cowork.paths import client_db_path
@@ -55,6 +57,7 @@ SLASH_COMMANDS: list[tuple[str, str]] = [
     ("channel", "switch to or create a channel"),
     ("invite", "mint a fresh invite token"),
     ("status", "set presence (online/away/busy/offline)"),
+    ("agent", "add / list / remove project agents"),
     ("save-transcript", "write the current channel to a file"),
     ("leave-project", "remove the current project from this device"),
     ("quit", "exit"),
@@ -88,6 +91,12 @@ HELP_TEXT = """[b]Cowork commands[/b]
                                           Cowork flips you to 'away' after a
                                           couple minutes idle and back on
                                           activity)
+  /agent add <name> <system prompt…>   — register a Claude-Agent-SDK-backed
+                                          agent in the current project; it
+                                          responds whenever someone @-mentions
+                                          it in any channel
+  /agent list                          — show registered agents
+  /agent remove <name>                 — tear down an agent
   /save-transcript [path]              — write the current channel to a file
   /leave-project                       — remove the current project from this device
   /quit                                — exit
@@ -129,6 +138,10 @@ class ProjectState:
     # Most recent @mentions for this project (newest first), shown in the
     # left-sidebar feed. Each entry: {channel_id, by_display_name, preview, ts}.
     recent_mentions: list[dict] = field(default_factory=list)
+    # Per-channel set of agent member ids currently mid-response, populated
+    # by the server's agent_thinking / agent_done frames. Drives the
+    # transient "🤖 @X is thinking…" status bar line.
+    agent_thinking: dict[str, set[str]] = field(default_factory=dict)
 
 
 class CoworkApp(App):
@@ -747,9 +760,54 @@ class CoworkApp(App):
                 if member.get("id"):
                     state.members[member["id"]] = member
                     self._refresh_members_panel()
+                    flavor = "agent" if member.get("kind") == "agent" else "joined"
                     self._write_system_in_project(
-                        project_id, f"[dim]→ @{member.get('display_name')} joined[/dim]"
+                        project_id,
+                        f"[dim]→ @{member.get('display_name')} {flavor}[/dim]",
                     )
+            elif ftype == "member_left":
+                mid = data.get("member_id")
+                if mid and mid in state.members:
+                    left = state.members.pop(mid)
+                    self._refresh_members_panel()
+                    self._write_system_in_project(
+                        project_id,
+                        f"[dim]← @{left.get('display_name')} left[/dim]",
+                    )
+            elif ftype == "agent_thinking":
+                aid = data.get("agent_id")
+                cid = data.get("channel_id")
+                agent = state.members.get(aid) or {}
+                if aid and cid:
+                    state.agent_thinking.setdefault(cid, set()).add(aid)
+                    if self.current_channel_id == cid:
+                        self._set_status(
+                            f"🤖 @{agent.get('display_name', '?')} is thinking…"
+                        )
+            elif ftype == "agent_done":
+                aid = data.get("agent_id")
+                cid = data.get("channel_id")
+                if aid and cid:
+                    bucket = state.agent_thinking.get(cid)
+                    if bucket:
+                        bucket.discard(aid)
+                        if not bucket:
+                            state.agent_thinking.pop(cid, None)
+                    if (
+                        self.current_channel_id == cid
+                        and not state.agent_thinking.get(cid)
+                    ):
+                        # Clear the status bar only if nothing else is
+                        # currently thinking; otherwise leave whatever the
+                        # most recent agent_thinking line said.
+                        self._set_status("")
+            elif ftype == "agent_error":
+                cid = data.get("channel_id")
+                name = data.get("agent_display_name", "?")
+                self._write_system_in_project(
+                    project_id,
+                    f"[red]agent @{name} failed: {data.get('message', '?')}[/red]",
+                )
             elif ftype == "mention":
                 cid = data.get("channel_id")
                 if cid:
@@ -954,7 +1012,9 @@ class CoworkApp(App):
         my_header.append(f"{my_dot} ", style=my_color)
         my_header.append(my_status, style=my_color)
         lines: list[Text] = [header_text, my_header, Text("")]
-        for m in state.members.values():
+        humans = [m for m in state.members.values() if m.get("kind") != "agent"]
+        agents = [m for m in state.members.values() if m.get("kind") == "agent"]
+        for m in humans:
             status = m.get("status") or "online"
             dot, color = STATUS_STYLE.get(status, STATUS_STYLE["online"])
             t = Text()
@@ -963,6 +1023,28 @@ class CoworkApp(App):
             if m["id"] == state.cached.member_id:
                 t.append("  (you)", style="dim")
             lines.append(t)
+        if agents:
+            lines.append(Text(""))
+            lines.append(Text("Agents", style="bold underline"))
+            # An agent is "busy" while we're awaiting its reply in any
+            # channel. The members panel collapses that to a single dot;
+            # the bottom status bar carries the per-channel detail.
+            busy_agent_ids = {
+                aid
+                for bucket in state.agent_thinking.values()
+                for aid in bucket
+            }
+            for m in agents:
+                stored = m.get("status") or "online"
+                effective = "busy" if m["id"] in busy_agent_ids else stored
+                dot, color = STATUS_STYLE.get(
+                    effective, STATUS_STYLE["online"]
+                )
+                t = Text()
+                t.append(f"{dot} ", style=color)
+                t.append("🤖 ", style="dim")
+                t.append(f"@{m['display_name']}")
+                lines.append(t)
         panel.update(Text("\n").join(lines))
 
     def _render_transcript(self) -> None:
@@ -1120,6 +1202,8 @@ class CoworkApp(App):
             await self._cmd_save_transcript(args)
         elif cmd == "status":
             await self._cmd_status(args)
+        elif cmd == "agent":
+            await self._cmd_agent(args)
         else:
             self._write_system(f"[red]unknown command: /{cmd}[/red] — try /help")
 
@@ -1285,6 +1369,109 @@ class CoworkApp(App):
         # presence as soon as the user has expressed a preference.
         self._user_set_status = True
         await self._send_status(new_status)
+
+    async def _cmd_agent(self, args: list[str]) -> None:
+        """Sub-command dispatch for /agent.
+
+        - /agent add <name> <system prompt…>   custom agent
+        - /agent list                          show agents in this project
+        - /agent remove <name>                 tear down an agent
+        """
+        if not self.current_project_id:
+            self._write_system("[red]no project selected[/red]")
+            return
+        if not args:
+            self._write_system(
+                "[red]usage: /agent <add|list|remove> ...[/red]"
+            )
+            return
+        sub, rest = args[0].lower(), args[1:]
+        if sub == "add":
+            await self._cmd_agent_add(rest)
+        elif sub == "list":
+            await self._cmd_agent_list()
+        elif sub in ("remove", "rm"):
+            await self._cmd_agent_remove(rest)
+        else:
+            self._write_system(
+                f"[red]unknown agent subcommand: {sub!r}[/red] — try add/list/remove"
+            )
+
+    async def _cmd_agent_add(self, rest: list[str]) -> None:
+        """`/agent add <name> <system prompt…>` — the prompt slurps every
+        remaining token (shlex already merged quoted strings), so users can
+        either quote the prompt or just type it after the name."""
+        if len(rest) < 2:
+            self._write_system(
+                "[red]usage: /agent add <name> <system prompt…>[/red]"
+            )
+            return
+        display_name = rest[0]
+        system_prompt = " ".join(rest[1:]).strip()
+        if not system_prompt:
+            self._write_system("[red]system prompt cannot be empty[/red]")
+            return
+        state = self.projects[self.current_project_id]
+        try:
+            await http_register_agent(
+                state.cached.server_url,
+                state.cached.member_token,
+                state.cached.project_id,
+                display_name=display_name,
+                system_prompt=system_prompt,
+            )
+        except ServerError as e:
+            self._write_system(f"[red]failed to register agent: {e}[/red]")
+            return
+        # The member_joined broadcast updates state + members panel for
+        # everyone, including this client; nothing else to do here beyond
+        # acknowledging.
+        self._write_system(
+            f"[dim]→ agent @{display_name} registered[/dim]"
+        )
+
+    async def _cmd_agent_list(self) -> None:
+        state = self.projects[self.current_project_id]
+        agents = [m for m in state.members.values() if m.get("kind") == "agent"]
+        if not agents:
+            self._write_system(
+                "[dim]no agents in this project — /agent add <name>"
+                " <prompt> to create one[/dim]"
+            )
+            return
+        lines = ["[b]Agents in this project[/b]"]
+        for m in agents:
+            lines.append(f"  🤖 @{m['display_name']}  ({m.get('status', 'online')})")
+        self._write_system("\n".join(lines))
+
+    async def _cmd_agent_remove(self, rest: list[str]) -> None:
+        if not rest:
+            self._write_system("[red]usage: /agent remove <name>[/red]")
+            return
+        target_name = rest[0].lstrip("@")
+        state = self.projects[self.current_project_id]
+        match = next(
+            (
+                m for m in state.members.values()
+                if m.get("kind") == "agent"
+                and m.get("display_name") == target_name
+            ),
+            None,
+        )
+        if not match:
+            self._write_system(
+                f"[red]no agent named @{target_name} in this project[/red]"
+            )
+            return
+        try:
+            await http_remove_agent(
+                state.cached.server_url,
+                state.cached.member_token,
+                state.cached.project_id,
+                agent_id=match["id"],
+            )
+        except ServerError as e:
+            self._write_system(f"[red]failed to remove agent: {e}[/red]")
 
     async def _cmd_save_transcript(self, args: list[str]) -> None:
         """Write the current channel transcript to a file so users have a

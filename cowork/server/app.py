@@ -17,15 +17,20 @@ from fastapi import (
 )
 
 from cowork.paths import server_db_path
+from cowork.server.agent_runner import AgentRunner, ClaudeSDKAgentRunner
 from cowork.server.db import Database
 from cowork.shared.protocol import (
+    AgentConfig,
     BootstrapResponse,
     CreateProjectRequest,
     CreateProjectResponse,
+    Member,
     MintInviteRequest,
     MintInviteResponse,
     RedeemInviteRequest,
     RedeemInviteResponse,
+    RegisterAgentRequest,
+    RegisterAgentResponse,
 )
 
 logger = logging.getLogger("cowork.server")
@@ -84,6 +89,10 @@ async def lifespan(app: FastAPI):
     await db.connect()
     app.state.db = db
     app.state.conn_manager = ConnectionManager()
+    # Default agent runner uses the real Claude Agent SDK. Tests replace
+    # this attribute with FakeAgentRunner before kicking off the scenario,
+    # so the suite never depends on the SDK binary being installed.
+    app.state.agent_runner = ClaudeSDKAgentRunner()
     try:
         yield
     finally:
@@ -99,6 +108,10 @@ async def db_dep() -> Database:
 
 async def conn_manager_dep() -> ConnectionManager:
     return app.state.conn_manager
+
+
+async def agent_runner_dep() -> AgentRunner:
+    return app.state.agent_runner
 
 
 async def bearer_member(
@@ -189,12 +202,12 @@ async def bootstrap(
         raise HTTPException(status_code=404, detail="project not found")
     channels = await db.list_channels(project_id)
     members = await db.list_members(project_id)
-    # Overlay connection state on top of the stored status preference: any
-    # member not currently holding a WS shows up as 'offline' on the wire,
-    # regardless of what they last set via /status.
+    # Overlay connection state on top of stored status — but only for
+    # humans. Agents are server-resident and never hold a WS, so their
+    # stored status (default 'online') is their real status.
     connected = manager.connected_member_ids(project_id)
     for m in members:
-        if m.id not in connected:
+        if m.kind == "human" and m.id not in connected:
             m.status = "offline"
     unread = await db.unread_state(member_id, project_id)
     return BootstrapResponse(
@@ -206,6 +219,70 @@ async def bootstrap(
     )
 
 
+@app.post(
+    "/projects/{project_id}/agents", response_model=RegisterAgentResponse
+)
+async def register_agent(
+    project_id: str,
+    req: RegisterAgentRequest,
+    member: tuple[str, str] = Depends(bearer_member),
+    db: Database = Depends(db_dep),
+    manager: ConnectionManager = Depends(conn_manager_dep),
+):
+    """Add an agent member to the project. Any existing member of the
+    project can register an agent. The agent shows up in everyone's
+    members panel and starts responding the moment somebody @-mentions
+    them in a channel."""
+    member_id, member_project = member
+    if member_project != project_id:
+        raise HTTPException(status_code=403, detail="not a member of this project")
+    config = AgentConfig(
+        system_prompt=req.system_prompt,
+        model=req.model,
+        history_messages=req.history_messages,
+    )
+    try:
+        agent = await db.create_agent(project_id, req.display_name.strip(), config)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    # Fan out so every connected client sees the new agent show up in
+    # their members panel without having to re-bootstrap.
+    await _broadcast(
+        manager,
+        project_id,
+        {"type": "member_joined", "data": {"member": agent.model_dump()}},
+    )
+    return RegisterAgentResponse(member_id=agent.id, display_name=agent.display_name)
+
+
+@app.delete("/projects/{project_id}/agents/{agent_id}", status_code=204)
+async def remove_agent(
+    project_id: str,
+    agent_id: str,
+    member: tuple[str, str] = Depends(bearer_member),
+    db: Database = Depends(db_dep),
+    manager: ConnectionManager = Depends(conn_manager_dep),
+):
+    """Tear down an agent. Restricted to agents (humans can't be removed
+    via this endpoint — there's no human-kick flow yet)."""
+    _, member_project = member
+    if member_project != project_id:
+        raise HTTPException(status_code=403, detail="not a member of this project")
+    target = await db.get_member(agent_id)
+    if not target or target.project_id != project_id:
+        raise HTTPException(status_code=404, detail="agent not found")
+    if target.kind != "agent":
+        raise HTTPException(status_code=400, detail="not an agent")
+    deleted = await db.delete_member(agent_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="agent not found")
+    await _broadcast(
+        manager,
+        project_id,
+        {"type": "member_left", "data": {"member_id": agent_id}},
+    )
+
+
 # ---- WebSocket ----
 
 
@@ -213,13 +290,13 @@ def _members_with_presence(
     members: list, connected: set[str]
 ) -> list[dict]:
     """Take a list of Member rows + a set of currently-connected member IDs
-    and produce dicts whose `status` reflects connection state. A member
-    whose preference is e.g. 'busy' but who isn't currently connected ships
-    as 'offline'; on reconnect their stored 'busy' is broadcast again."""
+    and produce dicts whose `status` reflects connection state. Humans go
+    'offline' when their last WS drops; agents always carry their stored
+    status (they live server-side and don't hold WebSockets at all)."""
     out: list[dict] = []
     for m in members:
         d = m.model_dump()
-        if m.id not in connected:
+        if m.kind == "human" and m.id not in connected:
             d["status"] = "offline"
         out.append(d)
     return out
@@ -239,6 +316,7 @@ async def _handle_send_message(
     sess: ClientSession,
     db: Database,
     manager: ConnectionManager,
+    runner: AgentRunner,
     data: dict,
 ) -> None:
     channel_id = data.get("channel_id")
@@ -249,9 +327,10 @@ async def _handle_send_message(
     message, mentioned = await db.post_message(channel_id, sess.member_id, content, parent_id)
     msg_payload = message.model_dump()
     await _broadcast(manager, sess.project_id, {"type": "message", "data": {"message": msg_payload}})
-    # Send mention pings to mentioned members who are connected (skip the
+    # Send mention pings to human members who are connected (skip the
     # author, who should never ping themselves; that case can still arise
     # when DB resolution misses the author exclusion, e.g. legacy data).
+    # Agents don't need WS pings — they react via the invocation path below.
     mentioned_ids = {m.id for m in mentioned} - {sess.member_id}
     if mentioned_ids:
         preview = (message.content[:80] + "…") if len(message.content) > 80 else message.content
@@ -272,6 +351,95 @@ async def _handle_send_message(
             await asyncio.gather(
                 *(s.send(mention_frame) for s in targets), return_exceptions=True
             )
+    # Kick off agent responses for any mentioned agent. Each runs in its
+    # own background task so the WS handler returns immediately and the
+    # author's send isn't blocked by SDK latency. The author is never an
+    # agent we invoke (already filtered above), so authoring loops are
+    # impossible from this code path.
+    invoker_name = message.display_name
+    for m in mentioned:
+        if m.kind == "agent" and m.id != sess.member_id:
+            asyncio.create_task(
+                _invoke_agent(
+                    db,
+                    manager,
+                    runner,
+                    project_id=sess.project_id,
+                    channel_id=channel_id,
+                    agent=m,
+                    invoker_display_name=invoker_name,
+                )
+            )
+
+
+async def _invoke_agent(
+    db: Database,
+    manager: ConnectionManager,
+    runner: AgentRunner,
+    *,
+    project_id: str,
+    channel_id: str,
+    agent: Member,
+    invoker_display_name: str,
+) -> None:
+    """Run one agent turn end-to-end: announce 'thinking', fetch
+    transcript, call the SDK runner, post the reply as a message authored
+    by the agent, then announce 'done'. Errors are surfaced to the channel
+    as a system message so users always know when an agent failed instead
+    of silently waiting."""
+    thinking_frame = {
+        "type": "agent_thinking",
+        "data": {"channel_id": channel_id, "agent_id": agent.id},
+    }
+    done_frame = {
+        "type": "agent_done",
+        "data": {"channel_id": channel_id, "agent_id": agent.id},
+    }
+    await _broadcast(manager, project_id, thinking_frame)
+    try:
+        config = await db.get_agent_config(agent.id)
+        if config is None:
+            raise RuntimeError(
+                f"agent {agent.display_name!r} has no config row"
+            )
+        history = await db.history(channel_id, before_message_id=None, limit=200)
+        reply_text = await runner.respond(
+            config,
+            agent_display_name=agent.display_name,
+            history=history,
+            invoker_display_name=invoker_display_name,
+        )
+        reply_text = (reply_text or "").strip()
+        if not reply_text:
+            return
+        reply, _ = await db.post_message(
+            channel_id, agent.id, reply_text, parent_id=None
+        )
+        await _broadcast(
+            manager,
+            project_id,
+            {"type": "message", "data": {"message": reply.model_dump()}},
+        )
+    except Exception as e:
+        logger.exception(
+            "agent %r failed to respond in project=%s channel=%s",
+            agent.display_name, project_id, channel_id,
+        )
+        await _broadcast(
+            manager,
+            project_id,
+            {
+                "type": "agent_error",
+                "data": {
+                    "channel_id": channel_id,
+                    "agent_id": agent.id,
+                    "agent_display_name": agent.display_name,
+                    "message": str(e),
+                },
+            },
+        )
+    finally:
+        await _broadcast(manager, project_id, done_frame)
 
 
 async def _handle_create_channel(
@@ -361,6 +529,7 @@ async def ws_endpoint(
 ):
     db: Database = ws.app.state.db
     manager: ConnectionManager = ws.app.state.conn_manager
+    runner: AgentRunner = ws.app.state.agent_runner
     info = await db.member_for_token(token)
     if not info or info[1] != project_id:
         await ws.close(code=4401)
@@ -441,7 +610,7 @@ async def ws_endpoint(
                 continue
             try:
                 if ftype == "send_message":
-                    await _handle_send_message(sess, db, manager, data)
+                    await _handle_send_message(sess, db, manager, runner, data)
                 elif ftype == "create_channel":
                     await _handle_create_channel(sess, db, manager, data)
                 elif ftype == "mark_read":
