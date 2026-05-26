@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import re
 import secrets
 import time
@@ -13,6 +14,7 @@ import aiosqlite
 
 from cowork.shared.protocol import (
     MEMBER_STATUSES,
+    AgentConfig,
     Channel,
     Member,
     Message,
@@ -241,7 +243,7 @@ class Database:
 
     async def list_members(self, project_id: str) -> list[Member]:
         async with self.conn.execute(
-            "SELECT id, project_id, display_name, joined_at, status"
+            "SELECT id, project_id, display_name, joined_at, status, kind"
             " FROM project_members WHERE project_id = ?"
             " ORDER BY joined_at",
             (project_id,),
@@ -250,12 +252,84 @@ class Database:
 
     async def get_member(self, member_id: str) -> Optional[Member]:
         async with self.conn.execute(
-            "SELECT id, project_id, display_name, joined_at, status"
+            "SELECT id, project_id, display_name, joined_at, status, kind"
             " FROM project_members WHERE id = ?",
             (member_id,),
         ) as cur:
             row = await cur.fetchone()
         return Member(**dict(row)) if row else None
+
+    async def create_agent(
+        self, project_id: str, display_name: str, config: AgentConfig
+    ) -> Member:
+        """Insert an agent member. Same uniqueness gate as a human member
+        (display name must be free in the project); the agent_config blob
+        carries the system prompt + model so the runner has everything it
+        needs without re-fetching elsewhere."""
+        validate_display_name(display_name)
+        project = await self.get_project(project_id)
+        if not project:
+            raise ValueError("project not found")
+        member_id = new_id()
+        now = time.time()
+        config_json = config.model_dump_json()
+        async with self._tx_lock:
+            try:
+                async with self.conn.execute(
+                    "SELECT 1 FROM project_members WHERE project_id = ?"
+                    " AND display_name = ?",
+                    (project_id, display_name),
+                ) as cur:
+                    if await cur.fetchone():
+                        raise ValueError(
+                            f"display name '{display_name}' already taken"
+                            " in this project"
+                        )
+                await self.conn.execute(
+                    "INSERT INTO project_members"
+                    " (id, project_id, display_name, joined_at,"
+                    "  status, kind, agent_config)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        member_id, project_id, display_name, now,
+                        "online", "agent", config_json,
+                    ),
+                )
+                await self.conn.commit()
+            except Exception:
+                await self.conn.rollback()
+                raise
+        member = await self.get_member(member_id)
+        assert member is not None  # we just inserted it
+        return member
+
+    async def delete_member(self, member_id: str) -> bool:
+        """Remove a member (typically an agent — humans get removed via a
+        future kick-member flow). Returns True if a row was deleted."""
+        async with self._tx_lock:
+            try:
+                cur = await self.conn.execute(
+                    "DELETE FROM project_members WHERE id = ?",
+                    (member_id,),
+                )
+                await self.conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                await self.conn.rollback()
+                raise
+
+    async def get_agent_config(self, member_id: str) -> Optional[AgentConfig]:
+        """Return the agent's persisted config, or None if the member is a
+        human (or doesn't exist). The runner needs this to invoke the SDK."""
+        async with self.conn.execute(
+            "SELECT agent_config FROM project_members"
+            " WHERE id = ? AND kind = 'agent'",
+            (member_id,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row or not row["agent_config"]:
+            return None
+        return AgentConfig(**json.loads(row["agent_config"]))
 
     async def update_member_status(self, member_id: str, status: str) -> Member:
         """Set a member's presence to one of the fixed presets."""
@@ -391,7 +465,7 @@ class Database:
         if names:
             placeholders = ",".join("?" for _ in names)
             async with self.conn.execute(
-                f"SELECT id, project_id, display_name, joined_at, status FROM project_members"
+                f"SELECT id, project_id, display_name, joined_at, status, kind FROM project_members"
                 f" WHERE project_id = ? AND display_name IN ({placeholders})",
                 (project_id, *names),
             ) as cur:

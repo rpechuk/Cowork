@@ -51,6 +51,50 @@ async def http_redeem_invite(server_url: str, invite_token: str, display_name: s
     return r.json()
 
 
+async def http_register_agent(
+    server_url: str,
+    member_token: str,
+    project_id: str,
+    display_name: str,
+    system_prompt: str,
+    model: str = "claude-sonnet-4-6",
+    history_messages: int = 20,
+) -> dict:
+    """POST a new agent membership. The server returns the agent's
+    member_id; the agent will also appear in everyone's members panel via
+    the broadcast `member_joined` frame, so the TUI doesn't have to plumb
+    the response through any extra state."""
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        r = await client.post(
+            f"{http_base(server_url)}/projects/{project_id}/agents",
+            headers={"Authorization": f"Bearer {member_token}"},
+            json={
+                "display_name": display_name,
+                "system_prompt": system_prompt,
+                "model": model,
+                "history_messages": history_messages,
+            },
+        )
+    if r.status_code >= 400:
+        raise ServerError(r.text)
+    return r.json()
+
+
+async def http_remove_agent(
+    server_url: str,
+    member_token: str,
+    project_id: str,
+    agent_id: str,
+) -> None:
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        r = await client.delete(
+            f"{http_base(server_url)}/projects/{project_id}/agents/{agent_id}",
+            headers={"Authorization": f"Bearer {member_token}"},
+        )
+    if r.status_code >= 400:
+        raise ServerError(r.text)
+
+
 async def http_mint_invite(server_url: str, member_token: str, project_id: str) -> dict:
     async with httpx.AsyncClient(timeout=10.0) as client:
         r = await client.post(

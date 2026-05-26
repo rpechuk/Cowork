@@ -10,6 +10,22 @@ from pydantic import BaseModel, Field
 MemberStatus = Literal["online", "away", "busy", "offline"]
 MEMBER_STATUSES: tuple[str, ...] = ("online", "away", "busy", "offline")
 
+# `kind` distinguishes a human member (driven by a WS-connected client) from
+# an agent member (driven server-side by the Claude Agent SDK runner). Both
+# share the same id space and display-name uniqueness rules.
+MemberKind = Literal["human", "agent"]
+
+
+class AgentConfig(BaseModel):
+    """Persisted agent definition. Stored as JSON in the project_members
+    row's agent_config column, deserialized on the server side when the
+    runner needs to invoke the agent."""
+    system_prompt: str
+    model: str = "claude-sonnet-4-6"
+    # Soft cap on conversation context the runner ships to the SDK. Pulled
+    # straight from the channel transcript ending at the @mention.
+    history_messages: int = 20
+
 
 class Project(BaseModel):
     id: str
@@ -23,6 +39,7 @@ class Member(BaseModel):
     display_name: str
     joined_at: float
     status: MemberStatus = "online"
+    kind: MemberKind = "human"
 
 
 class Channel(BaseModel):
@@ -83,6 +100,19 @@ class MintInviteRequest(BaseModel):
 
 class MintInviteResponse(BaseModel):
     invite_token: str
+
+
+class RegisterAgentRequest(BaseModel):
+    display_name: str
+    system_prompt: str
+    model: str = "claude-sonnet-4-6"
+    history_messages: int = 20
+
+
+class RegisterAgentResponse(BaseModel):
+    member_id: str
+    display_name: str
+    kind: MemberKind = "agent"
 
 
 class BootstrapResponse(BaseModel):
