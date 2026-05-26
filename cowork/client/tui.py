@@ -50,22 +50,66 @@ STATUS_STYLE: dict[str, tuple[str, str]] = {
 }
 RECENT_MENTIONS_KEEP = 5
 
-# The slash-command autocomplete reads from this single source-of-truth list
-# so the popup, the help text, and future docs all stay in sync. Each tuple
-# is (command-without-slash, one-line description).
-SLASH_COMMANDS: list[tuple[str, str]] = [
-    ("help", "show this help"),
-    ("new-project", "create a new project on a server"),
-    ("join", "join an existing project from an invite"),
-    ("channel", "switch to or create a channel"),
-    ("invite", "mint a fresh invite token"),
-    ("status", "set presence (online/away/busy/offline)"),
-    ("agent", "add / list / remove project agents"),
-    ("login", "authenticate the local Claude CLI (claude login)"),
-    ("save-transcript", "write the current channel to a file"),
-    ("leave-project", "remove the current project from this device"),
-    ("quit", "exit"),
-]
+# Slash-command registry. Decorating an `_cmd_*` method below with
+# `@command("name", "description")` is the ONLY thing required to register
+# a new slash command — both the autocomplete menu and the dispatcher
+# below read from this dict, so they can't drift out of sync.
+#
+# Registered in the order methods are defined on the class, which we then
+# re-sort below to match the order users see in /help.
+COMMAND_REGISTRY: dict[str, dict[str, str]] = {}
+
+
+def command(name: str, description: str):
+    """Mark an `async def _cmd_*(self, args)` method as a slash command.
+
+    The decorator only records metadata into COMMAND_REGISTRY; it returns
+    the method unchanged, so calling the method directly (in tests) still
+    works the normal way."""
+
+    def decorator(fn):
+        COMMAND_REGISTRY[name] = {
+            "description": description,
+            "method": fn.__name__,
+        }
+        return fn
+
+    return decorator
+
+
+# Display order in /help and the autocomplete popup. Commands not listed
+# here are appended in registration order — adding a new command without
+# touching this list still works, it just shows up at the bottom of /help.
+_COMMAND_DISPLAY_ORDER: tuple[str, ...] = (
+    "help",
+    "new-project",
+    "join",
+    "channel",
+    "invite",
+    "status",
+    "agent",
+    "login",
+    "save-transcript",
+    "leave-project",
+    "quit",
+)
+
+
+def slash_commands() -> list[tuple[str, str]]:
+    """Live view over the registry: (name, description) tuples in the
+    order /help renders them. Used by both the autocomplete popup and
+    any docs / introspection callers."""
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+    for name in _COMMAND_DISPLAY_ORDER:
+        entry = COMMAND_REGISTRY.get(name)
+        if entry:
+            out.append((name, entry["description"]))
+            seen.add(name)
+    for name, entry in COMMAND_REGISTRY.items():
+        if name not in seen:
+            out.append((name, entry["description"]))
+    return out
 
 # Auto-away defaults. The idle watchdog flips the user from online → away
 # after IDLE_AWAY_THRESHOLD_S of no keyboard activity, and back to online on
@@ -419,7 +463,7 @@ class CoworkApp(App):
     def _populate_slash(self, partial: str, ac: OptionList) -> None:
         partial_lower = partial.lower()
         matches = [
-            (cmd, desc) for cmd, desc in SLASH_COMMANDS
+            (cmd, desc) for cmd, desc in slash_commands()
             if cmd.startswith(partial_lower)
         ]
         # If the user has already typed a full command name, there is
@@ -1193,6 +1237,9 @@ class CoworkApp(App):
         )
 
     async def _handle_command(self, line: str) -> None:
+        """Parse `/cmd <args…>` and dispatch via COMMAND_REGISTRY. Adding
+        a new command means decorating its `_cmd_*` method with
+        `@command(name, description)` — no edits required here."""
         try:
             parts = shlex.split(line[1:])
         except ValueError as e:
@@ -1201,31 +1248,33 @@ class CoworkApp(App):
         if not parts:
             return
         cmd, args = parts[0], parts[1:]
-        if cmd == "help":
-            self._write_system(HELP_TEXT)
-        elif cmd == "quit":
-            await self.action_quit()
-        elif cmd == "new-project":
-            await self._cmd_new_project(args)
-        elif cmd == "join":
-            await self._cmd_join(args)
-        elif cmd == "channel":
-            await self._cmd_channel(args)
-        elif cmd == "invite":
-            await self._cmd_invite()
-        elif cmd == "leave-project":
-            await self._cmd_leave_project()
-        elif cmd == "save-transcript":
-            await self._cmd_save_transcript(args)
-        elif cmd == "status":
-            await self._cmd_status(args)
-        elif cmd == "agent":
-            await self._cmd_agent(args)
-        elif cmd == "login":
-            await self._cmd_login(args)
-        else:
-            self._write_system(f"[red]unknown command: /{cmd}[/red] — try /help")
+        entry = COMMAND_REGISTRY.get(cmd)
+        if entry is None:
+            self._write_system(
+                f"[red]unknown command: /{cmd}[/red] — try /help"
+            )
+            return
+        handler = getattr(self, entry["method"], None)
+        if handler is None:
+            # The decorator and the method got out of sync — shouldn't be
+            # reachable, but surface it loudly rather than silently
+            # swallowing the command.
+            self._write_system(
+                f"[red]internal: /{cmd} registered but {entry['method']}"
+                f" is not on CoworkApp[/red]"
+            )
+            return
+        await handler(args)
 
+    @command("help", "show this help")
+    async def _cmd_help(self, args: list[str]) -> None:
+        self._write_system(HELP_TEXT)
+
+    @command("quit", "exit")
+    async def _cmd_quit(self, args: list[str]) -> None:
+        await self.action_quit()
+
+    @command("new-project", "create a new project on a server")
     async def _cmd_new_project(self, args: list[str]) -> None:
         if len(args) < 1:
             self._write_system("[red]usage: /new-project <name> [server-url] [display-name][/red]")
@@ -1263,6 +1312,7 @@ class CoworkApp(App):
             f"  [b]/join {invite_url}[/b]"
         )
 
+    @command("join", "join an existing project from an invite")
     async def _cmd_join(self, args: list[str]) -> None:
         # Accept either:   /join cowork://host:port#TOKEN [display-name]
         # or the legacy:   /join <server-url> <invite-token> [display-name]
@@ -1309,6 +1359,7 @@ class CoworkApp(App):
         self._select_project(cp.project_id)
         self._write_system(f"Joined [b]{resp['project_name']}[/b] as @{display_name}.")
 
+    @command("channel", "switch to or create a channel")
     async def _cmd_channel(self, args: list[str]) -> None:
         if not self.current_project_id:
             self._write_system("[red]no project selected[/red]")
@@ -1330,7 +1381,8 @@ class CoworkApp(App):
                 return
         self._write_system(f"[red]no channel named #{target}[/red]")
 
-    async def _cmd_invite(self) -> None:
+    @command("invite", "mint a fresh invite token")
+    async def _cmd_invite(self, args: list[str]) -> None:
         if not self.current_project_id:
             self._write_system("[red]no project selected[/red]")
             return
@@ -1349,7 +1401,8 @@ class CoworkApp(App):
             f"They join with: [b]/join {invite_url}[/b]"
         )
 
-    async def _cmd_leave_project(self) -> None:
+    @command("leave-project", "remove the current project from this device")
+    async def _cmd_leave_project(self, args: list[str]) -> None:
         if not self.current_project_id:
             return
         pid = self.current_project_id
@@ -1366,6 +1419,7 @@ class CoworkApp(App):
         self._refresh_tree()
         self._write_system(f"Left {state.cached.project_name} on this device.")
 
+    @command("status", "set presence (online/away/busy/offline)")
     async def _cmd_status(self, args: list[str]) -> None:
         """Set the user's presence to one of the fixed presets. The server
         validates and rejects anything outside MEMBER_STATUSES."""
@@ -1398,6 +1452,7 @@ class CoworkApp(App):
         "Then re-run [b]/login[/b]."
     )
 
+    @command("login", "authenticate the local Claude CLI (claude login)")
     async def _cmd_login(self, args: list[str]) -> None:
         """Authenticate the local Claude CLI by shelling out to
         `claude login`. The TUI suspends itself for the duration so the
@@ -1460,6 +1515,7 @@ class CoworkApp(App):
             proc = subprocess.run([self.CLAUDE_CLI_BIN, "login"])
         return proc.returncode
 
+    @command("agent", "add / list / remove project agents")
     async def _cmd_agent(self, args: list[str]) -> None:
         """Sub-command dispatch for /agent.
 
@@ -1625,6 +1681,7 @@ class CoworkApp(App):
         except ServerError as e:
             self._write_system(f"[red]failed to remove agent: {e}[/red]")
 
+    @command("save-transcript", "write the current channel to a file")
     async def _cmd_save_transcript(self, args: list[str]) -> None:
         """Write the current channel transcript to a file so users have a
         guaranteed copy-paste path even when terminal mouse capture is on."""
