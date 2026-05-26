@@ -111,6 +111,16 @@ def slash_commands() -> list[tuple[str, str]]:
             out.append((name, entry["description"]))
     return out
 
+def _snippet(text: str, limit: int = 60) -> str:
+    """One-line truncated preview of a reasoning event. Newlines become
+    spaces (so the members panel and status bar each occupy one row),
+    long strings are ellipsized."""
+    flat = " ".join(text.split())
+    if len(flat) > limit:
+        return flat[: limit - 1] + "…"
+    return flat
+
+
 # Auto-away defaults. The idle watchdog flips the user from online → away
 # after IDLE_AWAY_THRESHOLD_S of no keyboard activity, and back to online on
 # the very next keystroke. Manually setting any /status pins the status and
@@ -152,6 +162,10 @@ HELP_TEXT = """[b]Cowork commands[/b]
                                           whenever someone @-mentions it
                                           in any channel
   /agent list                          — show registered agents
+  /agent show <name>                   — dump the agent's reasoning trail
+                                          from its most recent turn
+                                          (thinking blocks, text chunks,
+                                          tool calls)
   /agent remove <name>                 — tear down an agent
   /login                               — run `claude login` so agents on a
                                           server running on this same
@@ -203,6 +217,11 @@ class ProjectState:
     # by the server's agent_thinking / agent_done frames. Drives the
     # transient "🤖 @X is thinking…" status bar line.
     agent_thinking: dict[str, set[str]] = field(default_factory=dict)
+    # Streamed reasoning trail per agent (newest invocation only). Cleared
+    # on the next `agent_thinking` for the same agent so the trail you see
+    # via `/agent show` always reflects the most recent turn. Each entry:
+    # {channel_id, kind, text, ts}.
+    agent_reasoning: dict[str, list[dict]] = field(default_factory=dict)
 
 
 class CoworkApp(App):
@@ -841,9 +860,35 @@ class CoworkApp(App):
                 agent = state.members.get(aid) or {}
                 if aid and cid:
                     state.agent_thinking.setdefault(cid, set()).add(aid)
+                    # New invocation → wipe the prior reasoning trail so
+                    # `/agent show` always reflects the most recent turn.
+                    state.agent_reasoning[aid] = []
+                    self._refresh_members_panel()
                     if self.current_channel_id == cid:
                         self._set_status(
                             f"🤖 @{agent.get('display_name', '?')} is thinking…"
+                        )
+            elif ftype == "agent_progress":
+                aid = data.get("agent_id")
+                cid = data.get("channel_id")
+                kind = data.get("kind") or "text"
+                text = data.get("text") or ""
+                if aid and text:
+                    state.agent_reasoning.setdefault(aid, []).append(
+                        {"channel_id": cid, "kind": kind, "text": text}
+                    )
+                    self._refresh_members_panel()
+                    if self.current_channel_id == cid:
+                        agent = state.members.get(aid) or {}
+                        name = agent.get("display_name", "?")
+                        snippet = _snippet(text)
+                        verb = "thinking" if kind == "thinking" else (
+                            "calling " + text.split("(", 1)[0]
+                            if kind == "tool_use"
+                            else "writing"
+                        )
+                        self._set_status(
+                            f"🤖 @{name} {verb}: {snippet}"
                         )
             elif ftype == "agent_done":
                 aid = data.get("agent_id")
@@ -1097,7 +1142,8 @@ class CoworkApp(App):
             }
             for m in agents:
                 stored = m.get("status") or "online"
-                effective = "busy" if m["id"] in busy_agent_ids else stored
+                is_busy = m["id"] in busy_agent_ids
+                effective = "busy" if is_busy else stored
                 dot, color = STATUS_STYLE.get(
                     effective, STATUS_STYLE["online"]
                 )
@@ -1106,6 +1152,27 @@ class CoworkApp(App):
                 t.append("🤖 ", style="dim")
                 t.append(f"@{m['display_name']}")
                 lines.append(t)
+                # If the agent is mid-response, surface the latest
+                # streamed event under its name so users see what it's
+                # currently doing without leaving the panel. Thinking
+                # events get dimmed; text/tool_use are normal weight.
+                if is_busy:
+                    trail = state.agent_reasoning.get(m["id"]) or []
+                    if trail:
+                        last = trail[-1]
+                        kind = last.get("kind") or "text"
+                        snippet = _snippet(last.get("text") or "", limit=22)
+                        sub = Text()
+                        sub.append("    ↳ ", style="dim")
+                        if kind == "thinking":
+                            sub.append("thinking: ", style="dim italic")
+                            sub.append(snippet, style="dim italic")
+                        elif kind == "tool_use":
+                            sub.append("calling ", style="dim")
+                            sub.append(snippet, style="cyan")
+                        else:
+                            sub.append(snippet, style="dim")
+                        lines.append(sub)
         panel.update(Text("\n").join(lines))
 
     def _render_transcript(self) -> None:
@@ -1540,10 +1607,12 @@ class CoworkApp(App):
             await self._cmd_agent_remove(rest)
         elif sub == "presets":
             await self._cmd_agent_presets()
+        elif sub == "show":
+            await self._cmd_agent_show(rest)
         else:
             self._write_system(
                 f"[red]unknown agent subcommand: {sub!r}[/red] — try"
-                " add/list/remove/presets"
+                " add/list/remove/show/presets"
             )
 
     async def _cmd_agent_add(self, rest: list[str]) -> None:
@@ -1636,6 +1705,61 @@ class CoworkApp(App):
         lines = ["[b]Agent presets[/b] — use [b]/agent add preset:<name>[/b]"]
         for p in presets:
             lines.append(f"  🤖 [b]{p['name']}[/b]  — {p['description']}")
+        self._write_system("\n".join(lines))
+
+    async def _cmd_agent_show(self, rest: list[str]) -> None:
+        """`/agent show <name>` — dump the streamed reasoning trail from
+        the agent's most recent invocation into the transcript. Helpful
+        when a reply was long, when you missed the live status-bar
+        chatter, or when you want to see what tools the agent reached
+        for. Trail is per-agent and ephemeral (wiped at the start of the
+        next invocation)."""
+        if not rest:
+            self._write_system("[red]usage: /agent show <name>[/red]")
+            return
+        target_name = rest[0].lstrip("@")
+        state = self.projects[self.current_project_id]
+        match = next(
+            (
+                m for m in state.members.values()
+                if m.get("kind") == "agent"
+                and m.get("display_name") == target_name
+            ),
+            None,
+        )
+        if not match:
+            self._write_system(
+                f"[red]no agent named @{target_name} in this project[/red]"
+            )
+            return
+        trail = state.agent_reasoning.get(match["id"]) or []
+        if not trail:
+            self._write_system(
+                f"[dim]no reasoning recorded for @{target_name} yet —"
+                " @-mention them in a channel to see their thinking.[/dim]"
+            )
+            return
+        busy = any(
+            match["id"] in bucket
+            for bucket in state.agent_thinking.values()
+        )
+        header = (
+            f"[b]🤖 @{target_name}[/b]"
+            f" — {'live (still thinking)' if busy else 'most recent turn'}"
+            f" — {len(trail)} event{'s' if len(trail) != 1 else ''}"
+        )
+        lines = [header]
+        for i, ev in enumerate(trail, 1):
+            kind = ev.get("kind") or "text"
+            text = ev.get("text") or ""
+            tag = {
+                "thinking": "[dim italic]thinking[/dim italic]",
+                "tool_use": "[cyan]tool_use[/cyan]",
+                "text": "[dim]text[/dim]",
+            }.get(kind, kind)
+            # Indent the text so it's clearly subordinate to the tag.
+            indented = "\n".join("    " + line for line in text.splitlines())
+            lines.append(f"  [{i:>2}] {tag}\n{indented}")
         self._write_system("\n".join(lines))
 
     async def _cmd_agent_list(self) -> None:

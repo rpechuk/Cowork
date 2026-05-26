@@ -453,6 +453,27 @@ async def _invoke_agent(
         "data": {"channel_id": channel_id, "agent_id": agent.id},
     }
     await _broadcast(manager, project_id, thinking_frame)
+
+    async def on_progress(kind: str, text: str) -> None:
+        """Stream the runner's intermediate events to every client in the
+        project. Used to drive the per-agent reasoning trail in the TUI
+        (text/thinking snippet in the members panel, full transcript via
+        `/agent show <name>`)."""
+        await _broadcast(
+            manager,
+            project_id,
+            {
+                "type": "agent_progress",
+                "data": {
+                    "channel_id": channel_id,
+                    "agent_id": agent.id,
+                    "agent_display_name": agent.display_name,
+                    "kind": kind,
+                    "text": text,
+                },
+            },
+        )
+
     try:
         config = await db.get_agent_config(agent.id)
         if config is None:
@@ -465,6 +486,7 @@ async def _invoke_agent(
             agent_display_name=agent.display_name,
             history=history,
             invoker_display_name=invoker_display_name,
+            on_progress=on_progress,
         )
         reply_text = (reply_text or "").strip()
         if not reply_text:
